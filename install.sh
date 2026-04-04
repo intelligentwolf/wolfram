@@ -263,6 +263,52 @@ systemctl daemon-reload
 info "Enabling wolfram service"
 systemctl enable wolfram
 
+# Ensure swap exists — zswap needs a swap backend to work.
+ensure_swap() {
+    if swapon --show 2>/dev/null | grep -q .; then
+        info "Swap already configured"
+        return
+    fi
+
+    # No swap at all. Create a swap file.
+    # Size: ~3% of RAM, minimum 1G, maximum 8G.
+    TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    SWAP_MB=$(( TOTAL_KB / 1024 * 3 / 100 ))
+    [ "$SWAP_MB" -lt 1024 ] && SWAP_MB=1024
+    [ "$SWAP_MB" -gt 8192 ] && SWAP_MB=8192
+
+    SWAPFILE="/swapfile"
+    if [ -f "$SWAPFILE" ]; then
+        info "Swap file exists but not active — activating"
+    else
+        info "No swap configured — creating ${SWAP_MB}M swap file at $SWAPFILE"
+        info "  (zswap compresses pages in RAM; swap file is the required backend)"
+        dd if=/dev/zero of="$SWAPFILE" bs=1M count="$SWAP_MB" status=progress 2>&1
+        chmod 600 "$SWAPFILE"
+        mkswap "$SWAPFILE" >/dev/null
+    fi
+
+    swapon "$SWAPFILE"
+
+    # Persist across reboots.
+    if ! grep -q "$SWAPFILE" /etc/fstab 2>/dev/null; then
+        echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
+        info "  Added $SWAPFILE to /etc/fstab"
+    fi
+
+    # Low swappiness — we only want the kernel to swap when zswap says so.
+    sysctl -q vm.swappiness=10 2>/dev/null
+    if ! grep -q 'vm.swappiness' /etc/sysctl.d/wolfram.conf 2>/dev/null; then
+        echo "vm.swappiness=10" > /etc/sysctl.d/wolfram.conf
+        info "  Set vm.swappiness=10 (prefer RAM, use swap only for cold pages)"
+    fi
+
+    info "Swap ready: $(swapon --show --noheadings | awk '{print $1, $3}')"
+}
+
+ensure_swap
+echo ""
+
 # Check kernel features.
 echo ""
 info "Checking kernel features..."
