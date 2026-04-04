@@ -72,13 +72,46 @@ echo Y | sudo tee /sys/module/zswap/parameters/enabled
 
 ## Installation
 
+### Quick install (downloads pre-built binary)
+
 ```bash
-git clone https://github.com/wolfssoftware/wolfram.git
+git clone https://github.com/wolfsoftwaresystemsltd/wolfram.git
 cd wolfram
 sudo ./install.sh
 ```
 
-This builds the release binary, installs it to `/usr/local/bin/wolfram`, creates the config file at `/etc/wolfram/config.toml`, and sets up a systemd service.
+The installer automatically detects your platform, downloads the correct pre-built binary from GitHub Releases, and sets up the systemd service. If no pre-built binary is available it falls back to building from source.
+
+### Manual download
+
+Pre-built binaries are available for every release on the [Releases page](https://github.com/wolfsoftwaresystemsltd/wolfram/releases).
+
+| Platform | Binary | Notes |
+|----------|--------|-------|
+| x86_64 | `wolfram-x86_64-linux-musl` | Standard Linux servers and desktops |
+| ARM64 | `wolfram-aarch64-linux-musl` | Raspberry Pi 4/5, AWS Graviton, Oracle Ampere |
+| ARMv7 | `wolfram-armv7-linux-musleabihf` | Raspberry Pi 2/3 (32-bit OS), older ARM boards |
+
+The `musl` builds are fully static with no dependencies — they work on any Linux distribution.
+
+```bash
+# Example: install on x86_64
+curl -LO https://github.com/wolfsoftwaresystemsltd/wolfram/releases/latest/download/wolfram-x86_64-linux-musl.tar.gz
+tar xzf wolfram-x86_64-linux-musl.tar.gz
+sudo install -m 755 wolfram /usr/local/bin/
+```
+
+### Build from source
+
+```bash
+# Requires Rust 1.75+
+git clone https://github.com/wolfsoftwaresystemsltd/wolfram.git
+cd wolfram
+cargo build --release
+sudo install -m 755 target/release/wolfram /usr/local/bin/
+```
+
+### After installation
 
 ```bash
 # Start the service

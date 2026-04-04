@@ -1,8 +1,10 @@
 #!/bin/sh
 set -e
 
-# Wolfram installer — builds release binary and installs as a systemd service.
+# Wolfram installer — downloads a pre-built binary (or builds from source) and
+# installs as a systemd service.
 
+REPO="wolfsoftwaresystemsltd/wolfram"
 INSTALL_BIN="/usr/local/bin/wolfram"
 SERVICE_FILE="/etc/systemd/system/wolfram.service"
 CONFIG_DIR="/etc/wolfram"
@@ -32,19 +34,108 @@ if [ "$(id -u)" -ne 0 ]; then
     error "This script must be run as root (sudo ./install.sh)"
 fi
 
-# Check for cargo.
-if ! command -v cargo >/dev/null 2>&1; then
-    error "cargo not found — install Rust first: https://rustup.rs"
-fi
+# Detect platform.
+detect_platform() {
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64|amd64)   PLATFORM="x86_64" ;;
+        aarch64|arm64)   PLATFORM="aarch64" ;;
+        armv7l|armhf)    PLATFORM="armv7" ;;
+        *)               PLATFORM="" ;;
+    esac
 
-# Build release binary.
-info "Building release binary..."
-cd "$SCRIPT_DIR"
-sudo -u "${SUDO_USER:-$(logname)}" cargo build --release 2>&1
-BINARY="$SCRIPT_DIR/target/release/wolfram"
+    # Detect musl vs glibc.
+    if ldd --version 2>&1 | grep -qi musl; then
+        LIBC="musl"
+    else
+        LIBC="gnu"
+    fi
 
-if [ ! -f "$BINARY" ]; then
-    error "Build failed — binary not found at $BINARY"
+    case "${PLATFORM}-${LIBC}" in
+        x86_64-gnu)   ARTIFACT="wolfram-x86_64-linux-gnu" ;;
+        x86_64-musl)  ARTIFACT="wolfram-x86_64-linux-musl" ;;
+        aarch64-gnu)  ARTIFACT="wolfram-aarch64-linux-gnu" ;;
+        aarch64-musl) ARTIFACT="wolfram-aarch64-linux-musl" ;;
+        armv7-gnu)    ARTIFACT="wolfram-armv7-linux-gnueabihf" ;;
+        armv7-musl)   ARTIFACT="wolfram-armv7-linux-musleabihf" ;;
+        *)            ARTIFACT="" ;;
+    esac
+}
+
+# Try to download a pre-built binary from GitHub releases.
+download_binary() {
+    if [ -z "$ARTIFACT" ]; then
+        return 1
+    fi
+
+    # Need curl or wget.
+    if command -v curl >/dev/null 2>&1; then
+        DOWNLOAD="curl -fsSL"
+        DOWNLOAD_OUT="curl -fsSL -o"
+    elif command -v wget >/dev/null 2>&1; then
+        DOWNLOAD="wget -qO-"
+        DOWNLOAD_OUT="wget -qO"
+    else
+        return 1
+    fi
+
+    # Get latest release tag.
+    info "Checking for latest release..."
+    LATEST=$($DOWNLOAD "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null | \
+        grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//')
+
+    if [ -z "$LATEST" ]; then
+        warn "Could not fetch latest release"
+        return 1
+    fi
+
+    info "Latest release: $LATEST"
+    info "Downloading ${ARTIFACT}.tar.gz..."
+
+    URL="https://github.com/${REPO}/releases/download/${LATEST}/${ARTIFACT}.tar.gz"
+    TMPDIR=$(mktemp -d)
+
+    if $DOWNLOAD_OUT "$TMPDIR/wolfram.tar.gz" "$URL" 2>/dev/null; then
+        tar xzf "$TMPDIR/wolfram.tar.gz" -C "$TMPDIR"
+        if [ -f "$TMPDIR/wolfram" ]; then
+            BINARY="$TMPDIR/wolfram"
+            info "Downloaded pre-built binary for $ARCH ($LIBC)"
+            return 0
+        fi
+    fi
+
+    rm -rf "$TMPDIR"
+    warn "Download failed"
+    return 1
+}
+
+# Build from source as fallback.
+build_from_source() {
+    if ! command -v cargo >/dev/null 2>&1; then
+        error "No pre-built binary available for your platform and cargo not found.\nInstall Rust first: https://rustup.rs"
+    fi
+
+    info "Building from source..."
+    cd "$SCRIPT_DIR"
+    sudo -u "${SUDO_USER:-$(logname)}" cargo build --release 2>&1
+    BINARY="$SCRIPT_DIR/target/release/wolfram"
+
+    if [ ! -f "$BINARY" ]; then
+        error "Build failed — binary not found at $BINARY"
+    fi
+
+    info "Built from source"
+}
+
+# --- Main ---
+
+detect_platform
+info "Detected platform: ${ARCH} (${LIBC})"
+
+# Try pre-built binary first, fall back to building from source.
+if ! download_binary; then
+    warn "No pre-built binary available — building from source"
+    build_from_source
 fi
 
 # Stop existing service if running.
@@ -57,6 +148,11 @@ fi
 info "Installing binary to $INSTALL_BIN"
 install -m 755 "$BINARY" "$INSTALL_BIN"
 
+# Clean up temp download dir if used.
+if [ -n "$TMPDIR" ] && [ -d "$TMPDIR" ]; then
+    rm -rf "$TMPDIR"
+fi
+
 # Create config directory and install default config if not present.
 if [ ! -d "$CONFIG_DIR" ]; then
     info "Creating config directory $CONFIG_DIR"
@@ -64,8 +160,19 @@ if [ ! -d "$CONFIG_DIR" ]; then
 fi
 
 if [ ! -f "$CONFIG_DIR/config.toml" ]; then
-    info "Installing default config to $CONFIG_DIR/config.toml"
-    install -m 644 "$SCRIPT_DIR/config.example.toml" "$CONFIG_DIR/config.toml"
+    # Try to install from local copy first, otherwise download it.
+    if [ -f "$SCRIPT_DIR/config.example.toml" ]; then
+        info "Installing default config to $CONFIG_DIR/config.toml"
+        install -m 644 "$SCRIPT_DIR/config.example.toml" "$CONFIG_DIR/config.toml"
+    else
+        info "Downloading default config..."
+        URL="https://raw.githubusercontent.com/${REPO}/master/config.example.toml"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "$URL" -o "$CONFIG_DIR/config.toml" 2>/dev/null || warn "Could not download config — create /etc/wolfram/config.toml manually"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$CONFIG_DIR/config.toml" "$URL" 2>/dev/null || warn "Could not download config — create /etc/wolfram/config.toml manually"
+        fi
+    fi
 else
     warn "Config file already exists at $CONFIG_DIR/config.toml — not overwriting"
 fi
@@ -75,9 +182,19 @@ info "Creating data directories"
 mkdir -p "$DATA_DIR"
 mkdir -p "$CHECKPOINT_DIR"
 
-# Install systemd service.
-info "Installing systemd service"
-install -m 644 "$SCRIPT_DIR/wolfram.service" "$SERVICE_FILE"
+# Install systemd service — from local copy or download.
+if [ -f "$SCRIPT_DIR/wolfram.service" ]; then
+    info "Installing systemd service"
+    install -m 644 "$SCRIPT_DIR/wolfram.service" "$SERVICE_FILE"
+else
+    info "Downloading systemd service file..."
+    URL="https://raw.githubusercontent.com/${REPO}/master/wolfram.service"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$URL" -o "$SERVICE_FILE" 2>/dev/null || error "Could not download service file"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$SERVICE_FILE" "$URL" 2>/dev/null || error "Could not download service file"
+    fi
+fi
 
 # Reload systemd.
 info "Reloading systemd daemon"

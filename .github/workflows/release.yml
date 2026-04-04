@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 — standard Linux servers and desktops
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: wolfram-x86_64-linux-gnu
+
+          # x86_64 musl — fully static binary, works on any x86_64 Linux
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact: wolfram-x86_64-linux-musl
+
+          # ARM64 — Raspberry Pi 4/5, AWS Graviton, Oracle Ampere
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            artifact: wolfram-aarch64-linux-gnu
+
+          # ARM64 musl — static binary for any ARM64 Linux
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            artifact: wolfram-aarch64-linux-musl
+
+          # ARMv7 hard-float — Raspberry Pi 2/3 (32-bit OS), older ARM boards
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            artifact: wolfram-armv7-linux-gnueabihf
+            cross: true
+
+          # ARMv7 musl — static binary for 32-bit ARM
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            artifact: wolfram-armv7-linux-musleabihf
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install musl tools (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with cargo
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build with cross
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.artifact }}.tar.gz wolfram
+          cd ../../..
+          sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.tar.gz.sha256
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+          body: |
+            ## Installation
+
+            Download the binary for your platform, extract, and install:
+
+            ```bash
+            # x86_64 (most Linux servers and desktops)
+            curl -LO https://github.com/wolfsoftwaresystemsltd/wolfram/releases/download/${{ github.ref_name }}/wolfram-x86_64-linux-musl.tar.gz
+            tar xzf wolfram-x86_64-linux-musl.tar.gz
+            sudo install -m 755 wolfram /usr/local/bin/
+
+            # ARM64 (Raspberry Pi 4/5, AWS Graviton)
+            curl -LO https://github.com/wolfsoftwaresystemsltd/wolfram/releases/download/${{ github.ref_name }}/wolfram-aarch64-linux-musl.tar.gz
+
+            # ARMv7 (Raspberry Pi 2/3 32-bit)
+            curl -LO https://github.com/wolfsoftwaresystemsltd/wolfram/releases/download/${{ github.ref_name }}/wolfram-armv7-linux-musleabihf.tar.gz
+            ```
+
+            Or use the installer: `sudo ./install.sh`
+
+            ## Platforms
+
+            | File | Platform | Notes |
+            |------|----------|-------|
+            | `wolfram-x86_64-linux-gnu` | x86_64 glibc | Standard Linux servers/desktops |
+            | `wolfram-x86_64-linux-musl` | x86_64 static | Works on any x86_64 Linux |
+            | `wolfram-aarch64-linux-gnu` | ARM64 glibc | Raspberry Pi 4/5, Graviton, Ampere |
+            | `wolfram-aarch64-linux-musl` | ARM64 static | Works on any ARM64 Linux |
+            | `wolfram-armv7-linux-gnueabihf` | ARMv7 glibc | Raspberry Pi 2/3 (32-bit OS) |
+            | `wolfram-armv7-linux-musleabihf` | ARMv7 static | Works on any 32-bit ARM Linux |
+
+            The `musl` builds are fully static — no dependencies, work on any Linux distribution.
