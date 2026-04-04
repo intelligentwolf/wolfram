@@ -279,16 +279,26 @@ ensure_swap() {
 
     SWAPFILE="/swapfile"
     if [ -f "$SWAPFILE" ]; then
-        info "Swap file exists but not active — activating"
-    else
-        info "No swap configured — creating ${SWAP_MB}M swap file at $SWAPFILE"
-        info "  (zswap compresses pages in RAM; swap file is the required backend)"
-        dd if=/dev/zero of="$SWAPFILE" bs=1M count="$SWAP_MB" status=progress 2>&1
-        chmod 600 "$SWAPFILE"
-        mkswap "$SWAPFILE" >/dev/null
+        # File exists but isn't active — might be corrupt or have holes.
+        # Try to activate it; if that fails, recreate it.
+        if swapon "$SWAPFILE" 2>/dev/null; then
+            info "Activated existing swap file"
+        else
+            warn "Existing swap file is broken — recreating"
+            rm -f "$SWAPFILE"
+        fi
     fi
 
-    swapon "$SWAPFILE"
+    if [ ! -f "$SWAPFILE" ]; then
+        info "No swap configured — creating ${SWAP_MB}M swap file at $SWAPFILE"
+        info "  (zswap compresses pages in RAM; swap file is the required backend)"
+        # Use dd, not fallocate — fallocate creates holes on XFS/some filesystems
+        # which makes swapon reject the file.
+        dd if=/dev/zero of="$SWAPFILE" bs=1M count="$SWAP_MB" 2>&1 | tail -1
+        chmod 600 "$SWAPFILE"
+        mkswap "$SWAPFILE" >/dev/null
+        swapon "$SWAPFILE"
+    fi
 
     # Persist across reboots.
     if ! grep -q "$SWAPFILE" /etc/fstab 2>/dev/null; then
