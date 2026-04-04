@@ -277,33 +277,75 @@ ensure_swap() {
     [ "$SWAP_MB" -lt 1024 ] && SWAP_MB=1024
     [ "$SWAP_MB" -gt 8192 ] && SWAP_MB=8192
 
-    SWAPFILE="/swapfile"
-    if [ -f "$SWAPFILE" ]; then
-        # File exists but isn't active — might be corrupt or have holes.
-        # Try to activate it; if that fails, recreate it.
-        if swapon "$SWAPFILE" 2>/dev/null; then
+    SWAPIMG="/var/swapfile.img"
+
+    # Clean up any broken swap file from a previous attempt.
+    if [ -f "$SWAPIMG" ]; then
+        if swapon "$SWAPIMG" 2>/dev/null; then
             info "Activated existing swap file"
-        else
-            warn "Existing swap file is broken — recreating"
-            rm -f "$SWAPFILE"
+            return
         fi
+        # Try via loop device (needed on XFS).
+        LOOP=$(losetup -f 2>/dev/null)
+        if [ -n "$LOOP" ] && losetup "$LOOP" "$SWAPIMG" 2>/dev/null; then
+            if swapon "$LOOP" 2>/dev/null; then
+                info "Activated existing swap file via loop device"
+                return
+            fi
+            losetup -d "$LOOP" 2>/dev/null
+        fi
+        warn "Existing swap file is broken — recreating"
+        rm -f "$SWAPIMG"
+    fi
+    # Also clean up legacy /swapfile if broken.
+    [ -f /swapfile ] && ! swapon --show 2>/dev/null | grep -q /swapfile && rm -f /swapfile
+
+    info "No swap configured — creating ${SWAP_MB}M swap file"
+    info "  (zswap compresses pages in RAM; swap file is the required backend)"
+    dd if=/dev/zero of="$SWAPIMG" bs=1M count="$SWAP_MB" 2>&1 | tail -1
+    chmod 600 "$SWAPIMG"
+
+    # Try direct swap first (works on ext4, btrfs with recent kernels).
+    mkswap "$SWAPIMG" >/dev/null 2>&1
+    if swapon "$SWAPIMG" 2>/dev/null; then
+        info "  Swap file activated directly"
+        SWAP_DEV="$SWAPIMG"
+    else
+        # XFS and some filesystems need a loop device for swap.
+        info "  Filesystem doesn't support direct swap — using loop device"
+        LOOP=$(losetup -f)
+        losetup "$LOOP" "$SWAPIMG"
+        mkswap "$LOOP" >/dev/null 2>&1
+        swapon "$LOOP"
+        SWAP_DEV="$LOOP"
+
+        # Create a systemd service to set up the loop device on boot.
+        cat > /etc/systemd/system/wolfram-swap.service << SWAPEOF
+[Unit]
+Description=Wolfram swap file (loop device for XFS)
+Before=wolfram.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'LOOP=\$(losetup -f) && losetup \$LOOP $SWAPIMG && swapon \$LOOP'
+ExecStop=/bin/sh -c 'swapoff $SWAPIMG 2>/dev/null; losetup -D 2>/dev/null'
+
+[Install]
+WantedBy=multi-user.target
+SWAPEOF
+        systemctl daemon-reload
+        systemctl enable wolfram-swap >/dev/null 2>&1
+        info "  Created wolfram-swap.service for boot persistence"
     fi
 
-    if [ ! -f "$SWAPFILE" ]; then
-        info "No swap configured — creating ${SWAP_MB}M swap file at $SWAPFILE"
-        info "  (zswap compresses pages in RAM; swap file is the required backend)"
-        # Use dd, not fallocate — fallocate creates holes on XFS/some filesystems
-        # which makes swapon reject the file.
-        dd if=/dev/zero of="$SWAPFILE" bs=1M count="$SWAP_MB" 2>&1 | tail -1
-        chmod 600 "$SWAPFILE"
-        mkswap "$SWAPFILE" >/dev/null
-        swapon "$SWAPFILE"
-    fi
-
-    # Persist across reboots.
-    if ! grep -q "$SWAPFILE" /etc/fstab 2>/dev/null; then
-        echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
-        info "  Added $SWAPFILE to /etc/fstab"
+    # Persist direct swap file in fstab (only for non-loop case).
+    if [ "$SWAP_DEV" = "$SWAPIMG" ]; then
+        if ! grep -q "$SWAPIMG" /etc/fstab 2>/dev/null; then
+            echo "$SWAPIMG none swap sw 0 0" >> /etc/fstab
+            info "  Added $SWAPIMG to /etc/fstab"
+        fi
     fi
 
     # Low swappiness — we only want the kernel to swap when zswap says so.
