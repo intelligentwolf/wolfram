@@ -122,7 +122,7 @@ build_from_source() {
 # --- Main ---
 
 detect_platform
-info "Detected platform: ${ARCH} (${LIBC})"
+info "Detected platform: ${ARCH}"
 
 # Try pre-built binary first, fall back to building from source.
 if ! download_binary; then
@@ -226,6 +226,17 @@ else
     info "  CRIU: not installed (optional — needed for process hibernation)"
 fi
 
+# Start the service.
+info "Starting wolfram service..."
+systemctl start wolfram
+
+# Verify it's running.
+if systemctl is-active --quiet wolfram 2>/dev/null; then
+    info "Wolfram is running"
+else
+    warn "Wolfram failed to start — check: journalctl -u wolfram -e"
+fi
+
 # Done.
 echo ""
 info "Installation complete!"
@@ -235,10 +246,9 @@ echo "  Config:   $CONFIG_DIR/config.toml"
 echo "  Service:  $SERVICE_FILE"
 echo "  Data:     $DATA_DIR"
 echo ""
-echo "  Edit config:    sudo nano $CONFIG_DIR/config.toml"
-echo "  Start now:      sudo systemctl start wolfram"
-echo "  View logs:      sudo journalctl -u wolfram -f"
-echo "  Check status:   sudo systemctl status wolfram"
-echo "  Stop:           sudo systemctl stop wolfram"
-echo "  Uninstall:      sudo ./uninstall.sh"
+echo "  View logs:      journalctl -u wolfram -f"
+echo "  Check savings:  cat /var/lib/wolfram/stats.json"
+echo "  Check status:   systemctl status wolfram"
+echo "  Stop:           systemctl stop wolfram"
+echo "  Reconfigure:    nano $CONFIG_DIR/config.toml && systemctl restart wolfram"
 echo ""
