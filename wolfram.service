@@ -1,25 +1,22 @@
 [Unit]
 Description=Wolfram — proactive memory compression daemon
-Documentation=https://github.com/wolfssoftware/wolfram
+Documentation=https://github.com/wolfsoftwaresystemsltd/wolfram
 After=network.target
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/wolfram
-ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=10
-TimeoutStopSec=10
+TimeoutStopSec=60
+StartLimitBurst=5
+StartLimitIntervalSec=120
 
-# Security hardening — minimal privileges.
-# Wolfram needs CAP_SYS_ADMIN (pagemap, page_idle) and CAP_SYS_NICE (process_madvise).
-# If using CRIU hibernation, it also needs CAP_SYS_PTRACE and CAP_CHECKPOINT_RESTORE.
-AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE CAP_SYS_PTRACE CAP_CHECKPOINT_RESTORE
-NoNewPrivileges=yes
-ProtectSystem=strict
-ReadWritePaths=/var/lib/wolfram
+# Wolfram needs root for /proc/[pid]/pagemap, page_idle bitmap,
+# and process_madvise(). Runs as root intentionally.
 ProtectHome=yes
 PrivateTmp=yes
+ReadWritePaths=/var/lib/wolfram
 
 [Install]
 WantedBy=multi-user.target

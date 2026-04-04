@@ -105,8 +105,14 @@ impl StatsTracker {
 
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
-                if let Err(e) = std::fs::write(&self.path, &json) {
-                    log::debug!("Could not write stats to {}: {e}", self.path.display());
+                // Atomic write: write to temp file then rename.
+                let tmp = self.path.with_extension("tmp");
+                if let Err(e) = std::fs::write(&tmp, &json) {
+                    log::debug!("Could not write stats to {}: {e}", tmp.display());
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&tmp, &self.path) {
+                    log::debug!("Could not rename stats file: {e}");
                 }
             }
             Err(e) => {

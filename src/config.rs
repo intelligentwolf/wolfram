@@ -128,9 +128,34 @@ impl Default for Config {
             checkpoint_dir: PathBuf::from("/var/lib/wolfram/checkpoints"),
             enable_port_proxy: false,
             excluded_names: vec![
+                // Core system
                 "systemd".into(),
                 "wolfram".into(),
                 "sshd".into(),
+                // Container runtimes
+                "dockerd".into(),
+                "containerd".into(),
+                "containerd-shim".into(),
+                "lxc-start".into(),
+                // Kubernetes
+                "kubelet".into(),
+                "kube-proxy".into(),
+                "kube-apiserver".into(),
+                "kube-controller".into(), // truncated from kube-controller-manager
+                "kube-scheduler".into(),
+                "etcd".into(),
+                // Virtualisation
+                "qemu-system".into(),
+                // Proxmox
+                "pvedaemon".into(),
+                "pveproxy".into(),
+                "pvestatd".into(),
+                "pvefw".into(),
+                "pmxcfs".into(),
+                "corosync".into(),
+                // Storage
+                "ceph-osd".into(),
+                "ceph-mon".into(),
             ],
             excluded_pids: vec![1],
             dry_run: false,

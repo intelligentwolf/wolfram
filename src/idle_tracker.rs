@@ -118,10 +118,12 @@ pub fn check_idle(marked: &MarkedRegion) -> Result<IdleResult> {
     })
 }
 
-// Max pagemap read per region: 8MB buffer = 1M pages = 4GB of virtual address space.
-// Regions larger than this are read in chunks. This prevents multi-GB allocations
-// for processes with huge virtual address spaces (common on large-RAM servers).
+// Max pagemap read per chunk: 8MB buffer = 1M pages = 4GB of virtual address space.
 const MAX_PAGEMAP_READ: u64 = 1024 * 1024; // pages per chunk
+
+// Max PFNs to collect per region. Caps memory at ~8MB per region (512K * 16 bytes).
+// Regions beyond this are sampled, not fully tracked.
+const MAX_PFNS_PER_REGION: usize = 512 * 1024;
 
 /// Collect physical page frame numbers for a region by reading pagemap.
 fn collect_pfns(pid: u32, region: &MemoryRegion) -> Result<Vec<(u64, u64)>> {
@@ -149,7 +151,7 @@ fn collect_pfns(pid: u32, region: &MemoryRegion) -> Result<Vec<(u64, u64)>> {
 
     // Read pagemap in chunks to avoid huge allocations.
     let mut page_offset = start_page;
-    while page_offset < end_page {
+    while page_offset < end_page && pfns.len() < MAX_PFNS_PER_REGION {
         let chunk_pages = (end_page - page_offset).min(MAX_PAGEMAP_READ);
         let file_offset = page_offset * PAGEMAP_ENTRY_SIZE;
         pagemap.seek(SeekFrom::Start(file_offset))?;

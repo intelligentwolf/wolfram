@@ -134,6 +134,7 @@ fn print_system_info() {
 }
 
 /// Enable zswap if it's available but not turned on.
+/// Respects explicit kernel cmdline disable (zswap.enabled=0).
 fn ensure_zswap() {
     if compressor::zswap_enabled() {
         return;
@@ -143,6 +144,14 @@ fn ensure_zswap() {
     if !param.exists() {
         warn!("zswap not available in this kernel — compressed pages will go to disk swap");
         return;
+    }
+
+    // Don't override an explicit kernel cmdline disable.
+    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
+        if cmdline.contains("zswap.enabled=0") {
+            info!("zswap explicitly disabled via kernel cmdline — respecting that");
+            return;
+        }
     }
 
     info!("Enabling zswap...");

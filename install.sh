@@ -123,7 +123,9 @@ build_from_source() {
 generate_config() {
     # Detect what kind of system this is.
     ENV_TYPE="server"
-    ENV_EXCLUDES='"systemd", "wolfram", "sshd"'
+    # Base exclusions — always present. Note: kernel truncates /proc/[pid]/status Name: to
+    # 15 characters, so exclusion strings longer than 15 chars will never match.
+    ENV_EXCLUDES='"systemd", "wolfram", "sshd", "dockerd", "containerd", "containerd-shim", "kubelet", "kube-proxy", "kube-apiserver", "kube-controller", "kube-scheduler", "etcd"'
     MIN_ANON=50
     COLD=0.7
     PAGEOUT=0.9
@@ -136,17 +138,26 @@ generate_config() {
         COLD=0.5
         PAGEOUT=0.7
         PAGEOUT_CYCLES=2
-        ENV_EXCLUDES='"systemd", "wolfram", "sshd", "pvedaemon", "pveproxy", "pvestatd", "pvefw", "pmxcfs", "corosync", "lxc-start", "qemu-system", "ceph"'
+        ENV_EXCLUDES="$ENV_EXCLUDES"', "pvedaemon", "pveproxy", "pvestatd", "pvefw", "pmxcfs", "corosync", "lxc-start", "qemu-system", "ceph-osd", "ceph-mon"'
         info "Detected Proxmox VE — configuring for LXC/VM host"
 
-    # Docker host
+    # Kubernetes node
+    elif command -v kubelet >/dev/null 2>&1 || [ -d /var/lib/kubelet ]; then
+        ENV_TYPE="kubernetes"
+        MIN_ANON=20
+        COLD=0.5
+        PAGEOUT=0.7
+        PAGEOUT_CYCLES=2
+        ENV_EXCLUDES="$ENV_EXCLUDES"', "flanneld", "calico-node", "cilium"'
+        info "Detected Kubernetes node — configuring for K8s workloads"
+
+    # Docker host (not K8s)
     elif command -v dockerd >/dev/null 2>&1 || [ -f /run/docker.pid ]; then
         ENV_TYPE="docker"
         MIN_ANON=20
         COLD=0.5
         PAGEOUT=0.7
         PAGEOUT_CYCLES=2
-        ENV_EXCLUDES='"systemd", "wolfram", "sshd", "dockerd", "containerd", "containerd-shim"'
         info "Detected Docker host — configuring for container workloads"
 
     # Raspberry Pi
@@ -330,7 +341,7 @@ After=local-fs.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/sh -c 'LOOP=\$(losetup -f) && losetup \$LOOP $SWAPIMG && swapon \$LOOP'
-ExecStop=/bin/sh -c 'swapoff $SWAPIMG 2>/dev/null; losetup -D 2>/dev/null'
+ExecStop=/bin/sh -c 'DEV=\$(losetup -j $SWAPIMG -O NAME --noheadings) && swapoff \$DEV 2>/dev/null && losetup -d \$DEV 2>/dev/null'
 
 [Install]
 WantedBy=multi-user.target
