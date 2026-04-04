@@ -229,6 +229,19 @@ Wolfram applies increasing levels of intervention:
 | **Page out** | 90%+ idle, 3+ cycles | `MADV_PAGEOUT` — compress now | Immediate | Microsecond decompression on access |
 | **Hibernate** | All regions idle, 10+ cycles | CRIU checkpoint + kill | 100% of process | Seconds to restore; test your apps |
 
+## LXC / Containers
+
+**Install Wolfram on the host, not inside containers.**
+
+The kernel interfaces Wolfram uses (`/proc/[pid]/pagemap`, `/sys/kernel/mm/page_idle/bitmap`, `process_madvise()`) operate on physical page frames and are host-level — they're either unavailable or restricted inside containers. Running on the host means one Wolfram instance compresses cold pages across all your containers simultaneously.
+
+```toml
+# /etc/wolfram/config.toml — exclude container infrastructure
+excluded_names = ["systemd", "wolfram", "sshd", "lxc-start"]
+```
+
+This also works with unprivileged LXC containers — Wolfram running as root on the host can see and advise processes running under mapped UIDs.
+
 ## Safety
 
 - Wolfram never modifies process memory, code, or state
