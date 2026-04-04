@@ -89,7 +89,9 @@ That's it. The installer:
 | **Desktop** | Xorg/Wayland present | Standard thresholds, excludes display server/audio/WM |
 | **Server** | Default | Standard defaults |
 
-3. **Enables and starts** the systemd service immediately
+3. **Creates a swap file** if none exists (zswap needs a swap backend to work — without it, compression is silently ignored). Sets `vm.swappiness=10` so the kernel only swaps cold pages.
+4. **Enables and starts** the systemd service immediately
+5. **Auto-enables zswap** on startup so compressed pages stay in RAM
 
 No Rust toolchain needed. All builds are fully static (musl) — zero dependencies, works on any Linux distribution.
 
