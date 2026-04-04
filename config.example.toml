@@ -1,0 +1,55 @@
+# Wolfram configuration
+# Copy to /etc/wolfram/config.toml or ~/.config/wolfram/config.toml
+
+# Minimum anonymous memory (MiB) for a process to be considered for compression.
+# Processes below this threshold are ignored entirely.
+min_process_anon_mib = 50
+
+# Minimum memory region size (KiB) to track.
+# Smaller regions are not worth the overhead of idle tracking.
+min_region_kib = 1024
+
+# Seconds to wait between marking pages idle and checking them.
+# Longer = more accurate idle detection but slower cycles.
+idle_sample_secs = 30
+
+# Seconds between full scan cycles.
+# This is the total cycle time including the idle sample period.
+cycle_secs = 60
+
+# Fraction of pages that must be idle to trigger MADV_COLD (0.0 to 1.0).
+# MADV_COLD deprioritizes pages — kernel compresses them when convenient.
+cold_threshold = 0.7
+
+# Fraction of pages that must be idle to trigger MADV_PAGEOUT (0.0 to 1.0).
+# MADV_PAGEOUT forces immediate compression into zswap.
+pageout_threshold = 0.9
+
+# Number of consecutive idle cycles before escalating from COLD to PAGEOUT.
+pageout_after_cycles = 3
+
+# Enable CRIU-based process hibernation.
+# When a process is completely idle for hibernate_after_cycles, checkpoint it
+# to disk and kill it. Restores on demand or when Wolfram shuts down.
+# Requires: criu installed, root privileges.
+enable_hibernation = false
+
+# Consecutive fully-idle cycles before hibernating a process.
+hibernate_after_cycles = 10
+
+# Directory for CRIU checkpoint storage.
+checkpoint_dir = "/var/lib/wolfram/checkpoints"
+
+# Enable port proxy for transparent wake-on-connect.
+# When a process is hibernated, Wolfram listens on its TCP ports.
+# An incoming connection triggers automatic restore.
+enable_port_proxy = false
+
+# Process names to never touch (substring match).
+excluded_names = ["systemd", "wolfram", "sshd"]
+
+# PIDs to never touch.
+excluded_pids = [1]
+
+# Dry run — scan and report but don't compress or hibernate.
+dry_run = false
