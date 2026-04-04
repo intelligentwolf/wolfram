@@ -91,7 +91,7 @@ download_binary() {
         tar xzf "$TMPDIR/wolfram.tar.gz" -C "$TMPDIR"
         if [ -f "$TMPDIR/wolfram" ]; then
             BINARY="$TMPDIR/wolfram"
-            info "Downloaded pre-built binary for $ARCH ($LIBC)"
+            info "Downloaded pre-built binary for $ARCH (static)"
             return 0
         fi
     fi
@@ -117,6 +117,85 @@ build_from_source() {
     fi
 
     info "Built from source"
+}
+
+# Detect environment and generate optimised config.
+generate_config() {
+    # Detect what kind of system this is.
+    ENV_TYPE="server"
+    ENV_EXCLUDES='"systemd", "wolfram", "sshd"'
+    MIN_ANON=50
+    COLD=0.7
+    PAGEOUT=0.9
+    PAGEOUT_CYCLES=3
+
+    # Proxmox VE (LXC/QEMU host)
+    if [ -f /usr/bin/pvesh ] || [ -d /etc/pve ]; then
+        ENV_TYPE="proxmox"
+        MIN_ANON=20
+        COLD=0.5
+        PAGEOUT=0.7
+        PAGEOUT_CYCLES=2
+        ENV_EXCLUDES='"systemd", "wolfram", "sshd", "pvedaemon", "pveproxy", "pvestatd", "pvefw", "pmxcfs", "corosync", "lxc-start", "qemu-system", "ceph"'
+        info "Detected Proxmox VE — configuring for LXC/VM host"
+
+    # Docker host
+    elif command -v dockerd >/dev/null 2>&1 || [ -f /run/docker.pid ]; then
+        ENV_TYPE="docker"
+        MIN_ANON=20
+        COLD=0.5
+        PAGEOUT=0.7
+        PAGEOUT_CYCLES=2
+        ENV_EXCLUDES='"systemd", "wolfram", "sshd", "dockerd", "containerd", "containerd-shim"'
+        info "Detected Docker host — configuring for container workloads"
+
+    # Raspberry Pi
+    elif grep -qi 'raspberry\|bcm2' /proc/cpuinfo 2>/dev/null; then
+        ENV_TYPE="rpi"
+        MIN_ANON=10
+        COLD=0.5
+        PAGEOUT=0.7
+        PAGEOUT_CYCLES=2
+        ENV_EXCLUDES='"systemd", "wolfram", "sshd"'
+        info "Detected Raspberry Pi — configuring for low-memory system"
+
+    # Desktop (has a display server)
+    elif command -v Xorg >/dev/null 2>&1 || command -v wayland >/dev/null 2>&1 || [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
+        ENV_TYPE="desktop"
+        MIN_ANON=50
+        COLD=0.7
+        PAGEOUT=0.9
+        PAGEOUT_CYCLES=3
+        ENV_EXCLUDES='"systemd", "wolfram", "sshd", "Xorg", "Xwayland", "gnome-shell", "kwin", "plasmashell", "sway", "hyprland", "pipewire", "pulseaudio", "wireplumber"'
+        info "Detected desktop environment — excluding display server and audio"
+
+    else
+        info "Detected generic server — using standard config"
+    fi
+
+    info "Writing config to $CONFIG_DIR/config.toml ($ENV_TYPE profile)"
+    cat > "$CONFIG_DIR/config.toml" << CONFIGEOF
+# Wolfram configuration — auto-generated for: $ENV_TYPE
+# Edit to taste, then: systemctl restart wolfram
+
+min_process_anon_mib = $MIN_ANON
+min_region_kib = 1024
+idle_sample_secs = 30
+cycle_secs = 60
+
+cold_threshold = $COLD
+pageout_threshold = $PAGEOUT
+pageout_after_cycles = $PAGEOUT_CYCLES
+
+enable_hibernation = false
+hibernate_after_cycles = 10
+checkpoint_dir = "/var/lib/wolfram/checkpoints"
+enable_port_proxy = false
+
+excluded_names = [$ENV_EXCLUDES]
+excluded_pids = [1]
+dry_run = false
+CONFIGEOF
 }
 
 # --- Main ---
@@ -152,19 +231,7 @@ if [ ! -d "$CONFIG_DIR" ]; then
 fi
 
 if [ ! -f "$CONFIG_DIR/config.toml" ]; then
-    # Try to install from local copy first, otherwise download it.
-    if [ -f "$SCRIPT_DIR/config.example.toml" ]; then
-        info "Installing default config to $CONFIG_DIR/config.toml"
-        install -m 644 "$SCRIPT_DIR/config.example.toml" "$CONFIG_DIR/config.toml"
-    else
-        info "Downloading default config..."
-        URL="https://raw.githubusercontent.com/${REPO}/master/config.example.toml"
-        if command -v curl >/dev/null 2>&1; then
-            curl -fsSL "$URL" -o "$CONFIG_DIR/config.toml" 2>/dev/null || warn "Could not download config — create /etc/wolfram/config.toml manually"
-        elif command -v wget >/dev/null 2>&1; then
-            wget -qO "$CONFIG_DIR/config.toml" "$URL" 2>/dev/null || warn "Could not download config — create /etc/wolfram/config.toml manually"
-        fi
-    fi
+    generate_config
 else
     warn "Config file already exists at $CONFIG_DIR/config.toml — not overwriting"
 fi
