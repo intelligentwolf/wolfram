@@ -5,8 +5,9 @@ mod hibernator;
 mod idle_tracker;
 mod scanner;
 mod stats;
+mod zram;
 
-use log::{error, info, warn};
+use log::{error, info};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -39,7 +40,6 @@ fn main() {
     }
 
     print_system_info();
-    ensure_zswap();
     set_low_priority();
 
     // Set up signal handler for graceful shutdown.
@@ -134,42 +134,6 @@ fn print_system_info() {
     );
 }
 
-/// Enable zswap if it's available but not turned on.
-/// Respects explicit kernel cmdline disable (zswap.enabled=0).
-fn ensure_zswap() {
-    if compressor::zswap_enabled() {
-        return;
-    }
-
-    let param = std::path::Path::new("/sys/module/zswap/parameters/enabled");
-    if !param.exists() {
-        warn!("zswap not available in this kernel — compressed pages will go to disk swap");
-        return;
-    }
-
-    // Don't override an explicit kernel cmdline disable.
-    if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
-        if cmdline.contains("zswap.enabled=0") {
-            info!("zswap explicitly disabled via kernel cmdline — respecting that");
-            return;
-        }
-    }
-
-    info!("Enabling zswap...");
-    match std::fs::write(param, "Y") {
-        Ok(()) => {
-            if compressor::zswap_enabled() {
-                info!("  zswap enabled — compressed pages stay in RAM");
-            } else {
-                warn!("  Wrote to zswap parameter but it didn't take effect");
-            }
-        }
-        Err(e) => {
-            warn!("  Could not enable zswap: {e}");
-            warn!("  Compressed pages will go to disk swap (slower but still works)");
-        }
-    }
-}
 
 /// Set wolfram to lowest CPU and IO priority so it never starves real workloads.
 fn set_low_priority() {

@@ -285,102 +285,38 @@ systemctl daemon-reload
 info "Enabling wolfram service"
 systemctl enable wolfram
 
-# Ensure swap exists — zswap needs a swap backend to work.
-ensure_swap() {
-    if swapon --show 2>/dev/null | grep -q .; then
-        info "Swap already configured"
-        return
+# Wolfram manages zram devices itself at runtime — no swap file needed.
+# Load the zram module if available so wolfram can create devices on startup.
+if ! [ -d /sys/class/zram-control ]; then
+    modprobe zram 2>/dev/null && info "Loaded zram kernel module" || true
+fi
+
+# Clean up any swap files from previous wolfram versions.
+if [ -f /var/swapfile.img ]; then
+    swapoff /var/swapfile.img 2>/dev/null
+    # Check for loop device
+    LOOP_DEV=$(losetup -j /var/swapfile.img -O NAME --noheadings 2>/dev/null)
+    if [ -n "$LOOP_DEV" ]; then
+        swapoff "$LOOP_DEV" 2>/dev/null
+        losetup -d "$LOOP_DEV" 2>/dev/null
     fi
-
-    # No swap at all. Create a swap file.
-    # Size: ~3% of RAM, minimum 1G, maximum 8G.
-    TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
-    SWAP_MB=$(( TOTAL_KB / 1024 * 3 / 100 ))
-    [ "$SWAP_MB" -lt 1024 ] && SWAP_MB=1024
-    [ "$SWAP_MB" -gt 8192 ] && SWAP_MB=8192
-
-    SWAPIMG="/var/swapfile.img"
-
-    # Clean up any broken swap file from a previous attempt.
-    if [ -f "$SWAPIMG" ]; then
-        if swapon "$SWAPIMG" 2>/dev/null; then
-            info "Activated existing swap file"
-            return
-        fi
-        # Try via loop device (needed on XFS).
-        LOOP=$(losetup -f 2>/dev/null)
-        if [ -n "$LOOP" ] && losetup "$LOOP" "$SWAPIMG" 2>/dev/null; then
-            if swapon "$LOOP" 2>/dev/null; then
-                info "Activated existing swap file via loop device"
-                return
-            fi
-            losetup -d "$LOOP" 2>/dev/null
-        fi
-        warn "Existing swap file is broken — recreating"
-        rm -f "$SWAPIMG"
-    fi
-    # Also clean up legacy /swapfile if broken.
-    [ -f /swapfile ] && ! swapon --show 2>/dev/null | grep -q /swapfile && rm -f /swapfile
-
-    info "No swap configured — creating ${SWAP_MB}M swap file"
-    info "  (zswap compresses pages in RAM; swap file is the required backend)"
-    dd if=/dev/zero of="$SWAPIMG" bs=1M count="$SWAP_MB" 2>&1 | tail -1
-    chmod 600 "$SWAPIMG"
-
-    # Try direct swap first (works on ext4, btrfs with recent kernels).
-    mkswap "$SWAPIMG" >/dev/null 2>&1
-    if swapon "$SWAPIMG" 2>/dev/null; then
-        info "  Swap file activated directly"
-        SWAP_DEV="$SWAPIMG"
-    else
-        # XFS and some filesystems need a loop device for swap.
-        info "  Filesystem doesn't support direct swap — using loop device"
-        LOOP=$(losetup -f)
-        losetup "$LOOP" "$SWAPIMG"
-        mkswap "$LOOP" >/dev/null 2>&1
-        swapon "$LOOP"
-        SWAP_DEV="$LOOP"
-
-        # Create a systemd service to set up the loop device on boot.
-        cat > /etc/systemd/system/wolfram-swap.service << SWAPEOF
-[Unit]
-Description=Wolfram swap file (loop device for XFS)
-Before=wolfram.service
-After=local-fs.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/sh -c 'LOOP=\$(losetup -f) && losetup \$LOOP $SWAPIMG && swapon \$LOOP'
-ExecStop=/bin/sh -c 'DEV=\$(losetup -j $SWAPIMG -O NAME --noheadings) && swapoff \$DEV 2>/dev/null && losetup -d \$DEV 2>/dev/null'
-
-[Install]
-WantedBy=multi-user.target
-SWAPEOF
-        systemctl daemon-reload
-        systemctl enable wolfram-swap >/dev/null 2>&1
-        info "  Created wolfram-swap.service for boot persistence"
-    fi
-
-    # Persist direct swap file in fstab (only for non-loop case).
-    if [ "$SWAP_DEV" = "$SWAPIMG" ]; then
-        if ! grep -q "$SWAPIMG" /etc/fstab 2>/dev/null; then
-            echo "$SWAPIMG none swap sw 0 0" >> /etc/fstab
-            info "  Added $SWAPIMG to /etc/fstab"
-        fi
-    fi
-
-    # Low swappiness — we only want the kernel to swap when zswap says so.
-    sysctl -q vm.swappiness=10 2>/dev/null
-    if ! grep -q 'vm.swappiness' /etc/sysctl.d/wolfram.conf 2>/dev/null; then
-        echo "vm.swappiness=10" > /etc/sysctl.d/wolfram.conf
-        info "  Set vm.swappiness=10 (prefer RAM, use swap only for cold pages)"
-    fi
-
-    info "Swap ready: $(swapon --show --noheadings | awk '{print $1, $3}')"
-}
-
-ensure_swap
+    rm -f /var/swapfile.img
+    sed -i '\|/var/swapfile.img|d' /etc/fstab 2>/dev/null
+    info "Removed old swap file (wolfram now uses zram — no disk needed)"
+fi
+if [ -f /swapfile ]; then
+    swapoff /swapfile 2>/dev/null
+    rm -f /swapfile
+    sed -i '\|/swapfile|d' /etc/fstab 2>/dev/null
+fi
+# Remove old wolfram-swap service if present.
+if [ -f /etc/systemd/system/wolfram-swap.service ]; then
+    systemctl stop wolfram-swap 2>/dev/null
+    systemctl disable wolfram-swap 2>/dev/null
+    rm -f /etc/systemd/system/wolfram-swap.service
+    systemctl daemon-reload
+    info "Removed old wolfram-swap service"
+fi
 echo ""
 
 # Check kernel features.

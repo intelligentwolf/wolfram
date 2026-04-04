@@ -21,6 +21,7 @@ use crate::hibernator::Hibernator;
 use crate::idle_tracker::{self, MarkedRegion};
 use crate::scanner::{self, ProcessInfo};
 use crate::stats::StatsTracker;
+use crate::zram::ZramManager;
 
 /// Tracks how many consecutive cycles a region has been idle.
 struct RegionHistory {
@@ -107,11 +108,20 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<()> {
         anyhow::bail!("process_madvise not available");
     }
 
-    if compressor::zswap_enabled() {
-        info!("zswap is ENABLED — compressed pages stay in RAM");
+    // Set up zram compressed swap (preferred) or fall back to zswap.
+    let mut zram_mgr = ZramManager::new();
+    if crate::zram::is_supported() {
+        match zram_mgr.init() {
+            Ok(()) => info!("Using zram for in-RAM compression (no disk)"),
+            Err(e) => {
+                warn!("Could not init zram: {e}");
+                warn!("Falling back to zswap/swap");
+            }
+        }
+    } else if compressor::zswap_enabled() {
+        info!("zram not available — using zswap for compression");
     } else {
-        warn!("zswap is NOT enabled — pages will go to disk swap (slower)");
-        warn!("Consider: echo Y > /sys/module/zswap/parameters/enabled");
+        warn!("Neither zram nor zswap available — MADV_PAGEOUT will have limited effect");
     }
 
     let mut hibernator = Hibernator::new(&config);
@@ -155,6 +165,7 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<()> {
             cycle_count,
             &shutdown,
             &stats_tracker,
+            &mut zram_mgr,
         ) {
             Ok(()) => {}
             Err(e) => {
@@ -170,8 +181,11 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<()> {
         }
     }
 
-    // Graceful shutdown: always restore any hibernated processes, even if
-    // use_hibernation was toggled off after some processes were checkpointed.
+    // Graceful shutdown.
+    if zram_mgr.has_devices() {
+        info!("Shutting down — cleaning up zram devices...");
+        zram_mgr.cleanup();
+    }
     if hibernator.has_hibernated() {
         info!("Shutting down — restoring hibernated processes...");
         hibernator.restore_all();
@@ -207,6 +221,7 @@ fn run_cycle(
     cycle_count: u64,
     shutdown: &AtomicBool,
     stats_tracker: &StatsTracker,
+    zram_mgr: &mut ZramManager,
 ) -> Result<()> {
     // Step 1: Scan for memory-heavy processes.
     info!("Cycle {cycle_count}: scanning processes...");
@@ -215,7 +230,7 @@ fn run_cycle(
     if processes.is_empty() {
         info!("Cycle {cycle_count}: no processes above {} MiB threshold", config.min_process_anon_mib);
         let hstats = hibernator.stats();
-        stats_tracker.write(cycle_count, *total_compressed_kib, &hstats);
+        stats_tracker.write(cycle_count, *total_compressed_kib, &hstats, zram_mgr);
         return Ok(());
     }
 
@@ -400,17 +415,36 @@ fn run_cycle(
         debug!("Cycle {cycle_count}: no actions needed");
     }
 
+    // Dynamic zram management — grow or shrink based on usage.
+    zram_mgr.maybe_grow();
+    zram_mgr.maybe_shrink();
+
     // Write stats file and log summary.
     let hstats = hibernator.stats();
-    stats_tracker.write(cycle_count, *total_compressed_kib, &hstats);
+    stats_tracker.write(cycle_count, *total_compressed_kib, &hstats, zram_mgr);
 
-    if let Some(zs) = compressor::zswap_stats() {
+    // Log compression stats from zram (preferred) or zswap (fallback).
+    if let Some(zs) = zram_mgr.stats() {
+        let saved_mib = zs.saved_bytes / (1024 * 1024);
+        let original_mib = zs.original_bytes / (1024 * 1024);
+        let compressed_mib = zs.compressed_bytes / (1024 * 1024);
+        info!(
+            "  Saving: {} MiB (zram: {} MiB -> {} MiB, ratio {:.1}:1, {} devices, hibernated: {} / {} MiB)",
+            saved_mib + hstats.saved_mib,
+            original_mib,
+            compressed_mib,
+            zs.ratio,
+            zs.device_count,
+            hstats.hibernated,
+            hstats.saved_mib,
+        );
+    } else if let Some(zs) = compressor::zswap_stats() {
         let original_mib = (zs.stored_pages * 4096) / (1024 * 1024);
         let pool_mib = zs.pool_total_size / (1024 * 1024);
         let saved_mib = original_mib.saturating_sub(pool_mib);
         if saved_mib > 0 || hstats.hibernated > 0 {
             info!(
-                "  Saving: {} MiB (zswap: {} MiB compressed to {} MiB, hibernated: {} processes / {} MiB)",
+                "  Saving: {} MiB (zswap: {} MiB -> {} MiB, hibernated: {} / {} MiB)",
                 saved_mib + hstats.saved_mib,
                 original_mib,
                 pool_mib,

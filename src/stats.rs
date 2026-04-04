@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use crate::compressor;
 use crate::hibernator::HibernationStats;
+use crate::zram::ZramManager;
 
 const PAGE_SIZE_BYTES: u64 = 4096;
 
@@ -18,17 +19,19 @@ pub struct Stats {
     /// Number of completed cycles.
     pub cycles: u64,
 
-    // -- Compression (zswap) --
-    /// Pages currently stored compressed in zswap.
-    pub zswap_stored_pages: u64,
-    /// What those pages would occupy uncompressed (bytes).
-    pub zswap_original_bytes: u64,
-    /// Actual compressed pool size in RAM (bytes).
-    pub zswap_compressed_bytes: u64,
-    /// RAM saved by zswap compression (bytes). original - compressed.
-    pub zswap_saved_bytes: u64,
+    // -- Compression --
+    /// Backend: "zram" or "zswap" or "none".
+    pub compression_backend: String,
+    /// Data stored before compression (bytes).
+    pub original_bytes: u64,
+    /// Actual compressed size in RAM (bytes).
+    pub compressed_bytes: u64,
+    /// RAM saved by compression (bytes).
+    pub saved_bytes: u64,
     /// Compression ratio (e.g., 2.8 means 2.8:1).
-    pub zswap_ratio: f64,
+    pub compression_ratio: f64,
+    /// Number of zram devices (0 if using zswap).
+    pub zram_devices: usize,
 
     // -- Hibernation (CRIU) --
     /// Number of processes currently hibernated.
@@ -50,9 +53,7 @@ pub struct StatsTracker {
 
 impl StatsTracker {
     pub fn new(stats_dir: &Path) -> Self {
-        // Ensure directory exists (best-effort).
         std::fs::create_dir_all(stats_dir).ok();
-
         Self {
             path: stats_dir.join("stats.json"),
             started: Instant::now(),
@@ -65,38 +66,44 @@ impl StatsTracker {
         cycle_count: u64,
         lifetime_compressed_kib: u64,
         hibernation: &HibernationStats,
+        zram_mgr: &ZramManager,
     ) {
         let uptime_secs = self.started.elapsed().as_secs();
 
-        // Read zswap stats from kernel.
-        let (zswap_stored, zswap_original, zswap_compressed, zswap_saved, zswap_ratio) =
-            match compressor::zswap_stats() {
-                Some(zs) => {
-                    let original = zs.stored_pages * PAGE_SIZE_BYTES;
-                    let compressed = zs.pool_total_size;
-                    let saved = original.saturating_sub(compressed);
-                    let ratio = if compressed > 0 {
-                        original as f64 / compressed as f64
-                    } else {
-                        0.0
-                    };
-                    (zs.stored_pages, original, compressed, saved, ratio)
-                }
-                None => (0, 0, 0, 0, 0.0),
+        // Try zram stats first (preferred), fall back to zswap.
+        let (backend, original, compressed, saved, ratio, devices) =
+            if let Some(zs) = zram_mgr.stats() {
+                (
+                    "zram".to_string(),
+                    zs.original_bytes,
+                    zs.compressed_bytes,
+                    zs.saved_bytes,
+                    zs.ratio,
+                    zs.device_count,
+                )
+            } else if let Some(zs) = compressor::zswap_stats() {
+                let orig = zs.stored_pages * PAGE_SIZE_BYTES;
+                let comp = zs.pool_total_size;
+                let sav = orig.saturating_sub(comp);
+                let rat = if comp > 0 { orig as f64 / comp as f64 } else { 0.0 };
+                ("zswap".to_string(), orig, comp, sav, rat, 0)
+            } else {
+                ("none".to_string(), 0, 0, 0, 0.0, 0)
             };
 
-        let zswap_saved_mib = zswap_saved / (1024 * 1024);
-        let total_saved_mib = zswap_saved_mib + hibernation.saved_mib;
+        let saved_mib = saved / (1024 * 1024);
+        let total_saved_mib = saved_mib + hibernation.saved_mib;
 
         let stats = Stats {
             timestamp: now_iso8601(),
             uptime_secs,
             cycles: cycle_count,
-            zswap_stored_pages: zswap_stored,
-            zswap_original_bytes: zswap_original,
-            zswap_compressed_bytes: zswap_compressed,
-            zswap_saved_bytes: zswap_saved,
-            zswap_ratio,
+            compression_backend: backend,
+            original_bytes: original,
+            compressed_bytes: compressed,
+            saved_bytes: saved,
+            compression_ratio: ratio,
+            zram_devices: devices,
             hibernated_processes: hibernation.hibernated,
             hibernated_saved_mib: hibernation.saved_mib,
             total_saved_mib,
@@ -105,7 +112,6 @@ impl StatsTracker {
 
         match serde_json::to_string_pretty(&stats) {
             Ok(json) => {
-                // Atomic write: write to temp file then rename.
                 let tmp = self.path.with_extension("tmp");
                 if let Err(e) = std::fs::write(&tmp, &json) {
                     log::debug!("Could not write stats to {}: {e}", tmp.display());
@@ -123,7 +129,6 @@ impl StatsTracker {
 }
 
 fn now_iso8601() -> String {
-    // Read /proc/driver/rtc or use a simple approach with libc.
     let mut tv = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -132,13 +137,10 @@ fn now_iso8601() -> String {
         libc::clock_gettime(libc::CLOCK_REALTIME, &mut tv);
     }
     let secs = tv.tv_sec;
-
-    // Convert to UTC broken-down time.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe {
         libc::gmtime_r(&secs, &mut tm);
     }
-
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         tm.tm_year + 1900,
