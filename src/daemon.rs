@@ -136,6 +136,8 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<()> {
     let idle_sample = Duration::from_secs(config.idle_sample_secs);
     let cycle_interval = Duration::from_secs(config.cycle_secs);
 
+    info!("Entering main loop — cycle interval: {}s", config.cycle_secs);
+
     while !shutdown.load(Ordering::Relaxed) {
         cycle_count += 1;
         let cycle_start = Instant::now();
@@ -207,10 +209,13 @@ fn run_cycle(
     stats_tracker: &StatsTracker,
 ) -> Result<()> {
     // Step 1: Scan for memory-heavy processes.
+    info!("Cycle {cycle_count}: scanning processes...");
     let processes = scanner::scan_processes(min_anon_kib)?;
 
     if processes.is_empty() {
-        debug!("Cycle {cycle_count}: no processes above threshold");
+        info!("Cycle {cycle_count}: no processes above {} MiB threshold", config.min_process_anon_mib);
+        let hstats = hibernator.stats();
+        stats_tracker.write(cycle_count, *total_compressed_kib, &hstats);
         return Ok(());
     }
 
