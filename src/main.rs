@@ -219,4 +219,36 @@ fn tune_kernel() {
             info!("    {desc}");
         }
     }
+
+    // Enable KSM (Kernel Same-page Merging) if available but not running.
+    // KSM deduplicates identical pages across all processes — huge savings
+    // when running many instances of the same runtime (.NET, Java, Node).
+    let ksm_run = std::path::Path::new("/sys/kernel/mm/ksm/run");
+    if ksm_run.exists() {
+        let current = std::fs::read_to_string(ksm_run).unwrap_or_default();
+        if current.trim() == "0" {
+            match std::fs::write(ksm_run, "1") {
+                Ok(()) => {
+                    // Tune KSM scan speed — default is conservative (100 pages per 20ms).
+                    // Increase to 1000 pages to find duplicates faster.
+                    std::fs::write("/sys/kernel/mm/ksm/pages_to_scan", "1000").ok();
+                    info!("  KSM: enabled (deduplicates identical pages across processes)");
+                }
+                Err(e) => {
+                    log::debug!("Could not enable KSM: {e}");
+                }
+            }
+        } else {
+            let sharing = std::fs::read_to_string("/sys/kernel/mm/ksm/pages_sharing")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            if sharing > 0 {
+                let saved_mib = sharing * 4 / 1024; // pages * 4KB / 1024
+                info!("  KSM: already running ({} MiB deduplicated)", saved_mib);
+            } else {
+                info!("  KSM: already running");
+            }
+        }
+    }
 }
