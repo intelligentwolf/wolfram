@@ -137,7 +137,7 @@ generate_config() {
     # Desktop detection first — a dev machine with Docker is still a desktop.
     # Check for running display server processes (env vars are lost under sudo).
     IS_DESKTOP=false
-    if pgrep -x 'Xorg|Xwayland|gnome-shell|kwin_wayland|plasmashell|sway|hyprland|mutter' >/dev/null 2>&1; then
+    if pgrep 'Xorg|Xwayland|gnome-shell|kwin_wayland|plasmashell|sway|hyprland|mutter' >/dev/null 2>&1; then
         IS_DESKTOP=true
     elif [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
         IS_DESKTOP=true
