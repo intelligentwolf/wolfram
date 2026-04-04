@@ -180,7 +180,8 @@ fn set_low_priority() {
 
     // SCHED_IDLE — kernel only schedules us when nothing else wants the CPU.
     unsafe {
-        let param = libc::sched_param { sched_priority: 0 };
+        let mut param: libc::sched_param = std::mem::zeroed();
+        param.sched_priority = 0;
         libc::sched_setscheduler(0, libc::SCHED_IDLE, &param);
     }
 
