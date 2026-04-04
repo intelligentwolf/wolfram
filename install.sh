@@ -212,7 +212,17 @@ fi
 # Stop existing service if running.
 if systemctl is-active --quiet wolfram 2>/dev/null; then
     info "Stopping existing wolfram service..."
-    systemctl stop wolfram
+    systemctl stop wolfram --no-block 2>/dev/null
+    # Give it 5 seconds, then force kill if still running.
+    for i in 1 2 3 4 5; do
+        systemctl is-active --quiet wolfram 2>/dev/null || break
+        sleep 1
+    done
+    if systemctl is-active --quiet wolfram 2>/dev/null; then
+        warn "Service didn't stop cleanly — force killing"
+        kill -9 $(pidof wolfram) 2>/dev/null
+        sleep 1
+    fi
 fi
 
 # Install binary.

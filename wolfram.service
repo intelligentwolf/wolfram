@@ -9,6 +9,7 @@ ExecStart=/usr/local/bin/wolfram
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=10
+TimeoutStopSec=10
 
 # Security hardening — minimal privileges.
 # Wolfram needs CAP_SYS_ADMIN (pagemap, page_idle) and CAP_SYS_NICE (process_madvise).
