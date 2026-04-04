@@ -76,17 +76,24 @@ echo Y | sudo tee /sys/module/zswap/parameters/enabled
 curl -fsSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfram/master/install.sh | sudo sh
 ```
 
-That's it. The installer auto-detects your platform (x86_64, ARM64, ARMv7), downloads the correct pre-built binary, installs it to `/usr/local/bin/wolfram`, sets up the config and systemd service. No Rust toolchain needed.
+That's it. The installer:
 
-Pre-built binaries are available for:
+1. **Auto-detects your platform** (x86_64, ARM64, ARMv7) and downloads the correct static binary
+2. **Auto-detects your environment** and generates an optimised config:
 
-| Platform | Devices |
-|----------|---------|
-| x86_64 | Standard Linux servers and desktops |
-| ARM64 / aarch64 | Raspberry Pi 4/5, AWS Graviton, Oracle Ampere |
-| ARMv7 | Raspberry Pi 2/3 (32-bit OS), older ARM boards |
+| Environment | Detection | Tuning |
+|-------------|-----------|--------|
+| **Proxmox VE** | `/etc/pve` or `pvesh` | Aggressive compression, excludes pvedaemon/pveproxy/qemu/lxc-start |
+| **Docker host** | `dockerd` running | Aggressive compression, excludes dockerd/containerd |
+| **Raspberry Pi** | `/proc/cpuinfo` | Lowest thresholds for memory-constrained boards |
+| **Desktop** | Xorg/Wayland present | Standard thresholds, excludes display server/audio/WM |
+| **Server** | Default | Standard defaults |
 
-All builds are fully static (musl) — zero dependencies, works on any Linux distribution.
+3. **Enables and starts** the systemd service immediately
+
+No Rust toolchain needed. All builds are fully static (musl) — zero dependencies, works on any Linux distribution.
+
+Re-running the installer upgrades the binary in place. Delete `/etc/wolfram/config.toml` before re-running if you want it to regenerate the config for your environment.
 
 ### After installation
 
