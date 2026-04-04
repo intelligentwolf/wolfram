@@ -41,6 +41,7 @@ fn main() {
 
     print_system_info();
     set_low_priority();
+    tune_kernel();
 
     // Set up signal handler for graceful shutdown.
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -156,4 +157,66 @@ fn set_low_priority() {
     }
 
     info!("  Priority: nice 19, SCHED_IDLE, ionice idle");
+}
+
+/// Tune kernel parameters for optimal memory compression.
+/// Each sysctl is applied independently — if the file doesn't exist
+/// on a given kernel/distro, it's silently skipped. We never fail
+/// startup over a missing sysctl.
+fn tune_kernel() {
+    let tunings: &[(&str, &str, &str)] = &[
+        // Reclaim stale filesystem cache faster. Default 100.
+        // Higher = kernel drops cached files sooner, freeing pages for zram.
+        (
+            "/proc/sys/vm/vfs_cache_pressure",
+            "200",
+            "vfs_cache_pressure=200 (reclaim stale file cache faster)",
+        ),
+        // Stop proactive memory compaction. Default 20.
+        // Compaction wastes CPU building huge pages from fragments.
+        // With zram compression we don't need huge pages.
+        (
+            "/proc/sys/vm/compaction_proactiveness",
+            "0",
+            "compaction_proactiveness=0 (stop wasting CPU on defrag)",
+        ),
+        // Disable watermark boost. Default 15000.
+        // The kernel over-reclaims by 150% "just in case" after a reclaim event.
+        // With zram available, this just wastes effort.
+        (
+            "/proc/sys/vm/watermark_boost_factor",
+            "0",
+            "watermark_boost_factor=0 (no over-reclaim)",
+        ),
+    ];
+
+    let mut applied = Vec::new();
+
+    for &(path, value, description) in tunings {
+        let sysctl = std::path::Path::new(path);
+        if !sysctl.exists() {
+            continue;
+        }
+
+        // Don't overwrite if already set to our value.
+        if let Ok(current) = std::fs::read_to_string(sysctl) {
+            if current.trim() == value {
+                continue;
+            }
+        }
+
+        match std::fs::write(sysctl, value) {
+            Ok(()) => applied.push(description),
+            Err(e) => {
+                log::debug!("Could not set {path}: {e}");
+            }
+        }
+    }
+
+    if !applied.is_empty() {
+        info!("  Kernel tuning:");
+        for desc in &applied {
+            info!("    {desc}");
+        }
+    }
 }

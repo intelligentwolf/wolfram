@@ -39,8 +39,14 @@ pub struct Stats {
     /// RAM freed by hibernation (MiB).
     pub hibernated_saved_mib: u64,
 
+    // -- KSM (Kernel Same-page Merging) --
+    /// Pages deduplicated by KSM (0 if KSM not running).
+    pub ksm_pages_sharing: u64,
+    /// RAM saved by KSM deduplication (MiB).
+    pub ksm_saved_mib: u64,
+
     // -- Totals --
-    /// Total RAM currently being saved (MiB) — compression + hibernation.
+    /// Total RAM currently being saved (MiB) — compression + KSM + hibernation.
     pub total_saved_mib: u64,
     /// Total KiB pushed to compression over lifetime.
     pub lifetime_compressed_kib: u64,
@@ -92,7 +98,14 @@ impl StatsTracker {
             };
 
         let saved_mib = saved / (1024 * 1024);
-        let total_saved_mib = saved_mib + hibernation.saved_mib;
+
+        // Read KSM stats if available.
+        let ksm_sharing = read_sysfs_u64("/sys/kernel/mm/ksm/pages_sharing").unwrap_or(0);
+        let ksm_shared = read_sysfs_u64("/sys/kernel/mm/ksm/pages_shared").unwrap_or(0);
+        let ksm_saved_pages = ksm_sharing.saturating_sub(ksm_shared);
+        let ksm_saved_mib = (ksm_saved_pages * PAGE_SIZE_BYTES) / (1024 * 1024);
+
+        let total_saved_mib = saved_mib + ksm_saved_mib + hibernation.saved_mib;
 
         let stats = Stats {
             timestamp: now_iso8601(),
@@ -104,6 +117,8 @@ impl StatsTracker {
             saved_bytes: saved,
             compression_ratio: ratio,
             zram_devices: devices,
+            ksm_pages_sharing: ksm_sharing,
+            ksm_saved_mib,
             hibernated_processes: hibernation.hibernated,
             hibernated_saved_mib: hibernation.saved_mib,
             total_saved_mib,
@@ -150,4 +165,8 @@ fn now_iso8601() -> String {
         tm.tm_min,
         tm.tm_sec,
     )
+}
+
+fn read_sysfs_u64(path: &str) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
