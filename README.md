@@ -72,62 +72,44 @@ echo Y | sudo tee /sys/module/zswap/parameters/enabled
 
 ## Installation
 
-### Quick install (downloads pre-built binary)
-
 ```bash
-git clone https://github.com/wolfsoftwaresystemsltd/wolfram.git
-cd wolfram
-sudo ./install.sh
+curl -fsSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfram/master/install.sh | sudo sh
 ```
 
-The installer automatically detects your platform, downloads the correct pre-built binary from GitHub Releases, and sets up the systemd service. If no pre-built binary is available it falls back to building from source.
+That's it. The installer auto-detects your platform (x86_64, ARM64, ARMv7), downloads the correct pre-built binary, installs it to `/usr/local/bin/wolfram`, sets up the config and systemd service. No Rust toolchain needed.
 
-### Manual download
+Pre-built binaries are available for:
 
-Pre-built binaries are available for every release on the [Releases page](https://github.com/wolfsoftwaresystemsltd/wolfram/releases).
+| Platform | Devices |
+|----------|---------|
+| x86_64 | Standard Linux servers and desktops |
+| ARM64 / aarch64 | Raspberry Pi 4/5, AWS Graviton, Oracle Ampere |
+| ARMv7 | Raspberry Pi 2/3 (32-bit OS), older ARM boards |
 
-| Platform | Binary | Notes |
-|----------|--------|-------|
-| x86_64 | `wolfram-x86_64-linux-musl` | Standard Linux servers and desktops |
-| ARM64 | `wolfram-aarch64-linux-musl` | Raspberry Pi 4/5, AWS Graviton, Oracle Ampere |
-| ARMv7 | `wolfram-armv7-linux-musleabihf` | Raspberry Pi 2/3 (32-bit OS), older ARM boards |
-
-The `musl` builds are fully static with no dependencies — they work on any Linux distribution.
-
-```bash
-# Example: install on x86_64
-curl -LO https://github.com/wolfsoftwaresystemsltd/wolfram/releases/latest/download/wolfram-x86_64-linux-musl.tar.gz
-tar xzf wolfram-x86_64-linux-musl.tar.gz
-sudo install -m 755 wolfram /usr/local/bin/
-```
-
-### Build from source
-
-```bash
-# Requires Rust 1.75+
-git clone https://github.com/wolfsoftwaresystemsltd/wolfram.git
-cd wolfram
-cargo build --release
-sudo install -m 755 target/release/wolfram /usr/local/bin/
-```
+All builds are fully static (musl) — zero dependencies, works on any Linux distribution.
 
 ### After installation
 
 ```bash
-# Start the service
-sudo systemctl start wolfram
+sudo systemctl start wolfram        # Start the service
+sudo journalctl -u wolfram -f       # View live logs
+cat /var/lib/wolfram/stats.json     # Check memory savings
+sudo systemctl stop wolfram          # Stop
+```
 
-# View live logs
-sudo journalctl -u wolfram -f
+### Build from source (optional)
 
-# Check how much memory is being saved
-cat /var/lib/wolfram/stats.json
+```bash
+git clone https://github.com/wolfsoftwaresystemsltd/wolfram.git
+cd wolfram
+cargo build --release
+sudo ./install.sh   # uses local build instead of downloading
+```
 
-# Stop
-sudo systemctl stop wolfram
+### Uninstall
 
-# Uninstall
-sudo ./uninstall.sh
+```bash
+curl -fsSL https://raw.githubusercontent.com/wolfsoftwaresystemsltd/wolfram/master/uninstall.sh | sudo sh
 ```
 
 ## Usage
@@ -255,14 +237,6 @@ Wolfram applies increasing levels of intervention:
 - On shutdown (SIGTERM/SIGINT), all hibernated processes are automatically restored
 - Dry-run mode (`--dry-run`) lets you see what would happen without any changes
 - The systemd service runs with minimal capabilities and filesystem restrictions
-
-## Building from source
-
-```bash
-# Requires Rust 1.75+
-cargo build --release
-sudo ./target/release/wolfram --dry-run -v
-```
 
 ## License
 
