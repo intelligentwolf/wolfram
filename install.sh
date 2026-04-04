@@ -134,7 +134,18 @@ generate_config() {
     PAGEOUT=0.9
     PAGEOUT_CYCLES=3
 
-    # Proxmox VE (LXC/QEMU host)
+    # Desktop detection first — a dev machine with Docker is still a desktop.
+    # Check for running display server processes (env vars are lost under sudo).
+    IS_DESKTOP=false
+    if pgrep -x 'Xorg|Xwayland|gnome-shell|kwin_wayland|plasmashell|sway|hyprland|mutter' >/dev/null 2>&1; then
+        IS_DESKTOP=true
+    elif [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
+        IS_DESKTOP=true
+    elif [ -d /usr/share/xsessions ] || [ -d /usr/share/wayland-sessions ]; then
+        IS_DESKTOP=true
+    fi
+
+    # Proxmox VE (LXC/QEMU host) — check before desktop since Proxmox has X libs
     if [ -f /usr/bin/pvesh ] || [ -d /etc/pve ]; then
         ENV_TYPE="proxmox"
         MIN_ANON=100
@@ -158,18 +169,7 @@ generate_config() {
         ENV_EXCLUDES="$ENV_EXCLUDES"', "flanneld", "calico-node", "cilium"'
         info "Detected Kubernetes node — configuring for K8s workloads"
 
-    # Docker host (not K8s)
-    elif command -v dockerd >/dev/null 2>&1 || [ -f /run/docker.pid ]; then
-        ENV_TYPE="docker"
-        MIN_ANON=50
-        MIN_REGION=4096
-        CYCLE_SECS=180
-        COLD=0.6
-        PAGEOUT=0.8
-        PAGEOUT_CYCLES=2
-        info "Detected Docker host — configuring for container workloads"
-
-    # Raspberry Pi
+    # Raspberry Pi (before desktop — Pi can have a desktop too)
     elif grep -qi 'raspberry\|bcm2' /proc/cpuinfo 2>/dev/null; then
         ENV_TYPE="rpi"
         MIN_ANON=10
@@ -181,15 +181,28 @@ generate_config() {
         PAGEOUT_CYCLES=3
         info "Detected Raspberry Pi — configuring for low-memory system"
 
-    # Desktop (has a display server)
-    elif command -v Xorg >/dev/null 2>&1 || command -v wayland >/dev/null 2>&1 || [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
+    # Desktop (check before Docker — a dev machine with Docker is still a desktop)
+    elif [ "$IS_DESKTOP" = true ]; then
         ENV_TYPE="desktop"
         MIN_ANON=50
+        MIN_REGION=2048
+        CYCLE_SECS=120
         COLD=0.7
         PAGEOUT=0.9
         PAGEOUT_CYCLES=3
-        ENV_EXCLUDES='"systemd", "wolfram", "sshd", "Xorg", "Xwayland", "gnome-shell", "kwin", "plasmashell", "sway", "hyprland", "pipewire", "pulseaudio", "wireplumber"'
+        ENV_EXCLUDES="$ENV_EXCLUDES"', "Xorg", "Xwayland", "gnome-shell", "kwin_wayland", "kwin_x11", "plasmashell", "sway", "hyprland", "mutter", "pipewire", "pulseaudio", "wireplumber", "mutter"'
         info "Detected desktop environment — excluding display server and audio"
+
+    # Docker host (headless server only — desktops with Docker handled above)
+    elif command -v dockerd >/dev/null 2>&1 || [ -f /run/docker.pid ]; then
+        ENV_TYPE="docker"
+        MIN_ANON=50
+        MIN_REGION=4096
+        CYCLE_SECS=180
+        COLD=0.6
+        PAGEOUT=0.8
+        PAGEOUT_CYCLES=2
+        info "Detected Docker host — configuring for container workloads"
 
     else
         info "Detected generic server — using standard config"
@@ -330,17 +343,10 @@ else
     warn "  Wolfram will still work but with reduced accuracy"
 fi
 
-if [ -f /sys/module/zswap/parameters/enabled ]; then
-    ZSWAP=$(cat /sys/module/zswap/parameters/enabled)
-    if [ "$ZSWAP" = "Y" ]; then
-        info "  zswap: enabled"
-    else
-        warn "  zswap: disabled — compressed pages will go to disk swap"
-        warn "  Enable with: echo Y > /sys/module/zswap/parameters/enabled"
-        warn "  To persist, add 'zswap.enabled=1' to kernel command line"
-    fi
+if [ -d /sys/class/zram-control ] || modprobe --dry-run zram 2>/dev/null; then
+    info "  zram: available (wolfram creates compressed swap in RAM — no disk needed)"
 else
-    warn "  zswap: not available in this kernel"
+    warn "  zram: not available — wolfram will fall back to zswap if available"
 fi
 
 if command -v criu >/dev/null 2>&1; then
