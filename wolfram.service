@@ -6,6 +6,8 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/wolfram
+Nice=19
+IOSchedulingClass=idle
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=60

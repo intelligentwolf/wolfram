@@ -127,6 +127,9 @@ generate_config() {
     # 15 characters, so exclusion strings longer than 15 chars will never match.
     ENV_EXCLUDES='"systemd", "wolfram", "sshd", "dockerd", "containerd", "containerd-shim", "kubelet", "kube-proxy", "kube-apiserver", "kube-controller", "kube-scheduler", "etcd"'
     MIN_ANON=50
+    MIN_REGION=4096
+    CYCLE_SECS=120
+    IDLE_SAMPLE=30
     COLD=0.7
     PAGEOUT=0.9
     PAGEOUT_CYCLES=3
@@ -134,7 +137,9 @@ generate_config() {
     # Proxmox VE (LXC/QEMU host)
     if [ -f /usr/bin/pvesh ] || [ -d /etc/pve ]; then
         ENV_TYPE="proxmox"
-        MIN_ANON=20
+        MIN_ANON=100
+        MIN_REGION=4096
+        CYCLE_SECS=300
         COLD=0.5
         PAGEOUT=0.7
         PAGEOUT_CYCLES=2
@@ -144,19 +149,23 @@ generate_config() {
     # Kubernetes node
     elif command -v kubelet >/dev/null 2>&1 || [ -d /var/lib/kubelet ]; then
         ENV_TYPE="kubernetes"
-        MIN_ANON=20
-        COLD=0.5
-        PAGEOUT=0.7
-        PAGEOUT_CYCLES=2
+        MIN_ANON=100
+        MIN_REGION=4096
+        CYCLE_SECS=300
+        COLD=0.6
+        PAGEOUT=0.8
+        PAGEOUT_CYCLES=3
         ENV_EXCLUDES="$ENV_EXCLUDES"', "flanneld", "calico-node", "cilium"'
         info "Detected Kubernetes node — configuring for K8s workloads"
 
     # Docker host (not K8s)
     elif command -v dockerd >/dev/null 2>&1 || [ -f /run/docker.pid ]; then
         ENV_TYPE="docker"
-        MIN_ANON=20
-        COLD=0.5
-        PAGEOUT=0.7
+        MIN_ANON=50
+        MIN_REGION=4096
+        CYCLE_SECS=180
+        COLD=0.6
+        PAGEOUT=0.8
         PAGEOUT_CYCLES=2
         info "Detected Docker host — configuring for container workloads"
 
@@ -164,10 +173,12 @@ generate_config() {
     elif grep -qi 'raspberry\|bcm2' /proc/cpuinfo 2>/dev/null; then
         ENV_TYPE="rpi"
         MIN_ANON=10
+        MIN_REGION=1024
+        CYCLE_SECS=300
+        IDLE_SAMPLE=20
         COLD=0.5
         PAGEOUT=0.7
-        PAGEOUT_CYCLES=2
-        ENV_EXCLUDES='"systemd", "wolfram", "sshd"'
+        PAGEOUT_CYCLES=3
         info "Detected Raspberry Pi — configuring for low-memory system"
 
     # Desktop (has a display server)
@@ -190,9 +201,9 @@ generate_config() {
 # Edit to taste, then: systemctl restart wolfram
 
 min_process_anon_mib = $MIN_ANON
-min_region_kib = 1024
-idle_sample_secs = 30
-cycle_secs = 60
+min_region_kib = $MIN_REGION
+idle_sample_secs = $IDLE_SAMPLE
+cycle_secs = $CYCLE_SECS
 
 cold_threshold = $COLD
 pageout_threshold = $PAGEOUT

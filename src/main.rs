@@ -40,6 +40,7 @@ fn main() {
 
     print_system_info();
     ensure_zswap();
+    set_low_priority();
 
     // Set up signal handler for graceful shutdown.
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -168,4 +169,26 @@ fn ensure_zswap() {
             warn!("  Compressed pages will go to disk swap (slower but still works)");
         }
     }
+}
+
+/// Set wolfram to lowest CPU and IO priority so it never starves real workloads.
+fn set_low_priority() {
+    // nice 19 — lowest CPU scheduling priority.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+    }
+
+    // SCHED_IDLE — kernel only schedules us when nothing else wants the CPU.
+    unsafe {
+        let param = libc::sched_param { sched_priority: 0 };
+        libc::sched_setscheduler(0, libc::SCHED_IDLE, &param);
+    }
+
+    // ionice class 3 (idle) — only do IO when disk is idle.
+    // ioprio_set(IOPRIO_WHO_PROCESS, 0, IOPRIO_CLASS_IDLE << 13)
+    unsafe {
+        libc::syscall(251 as libc::c_long, 1 as libc::c_int, 0 as libc::c_int, (3 << 13) as libc::c_int);
+    }
+
+    info!("  Priority: nice 19, SCHED_IDLE, ionice idle");
 }

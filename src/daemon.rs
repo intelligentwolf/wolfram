@@ -241,6 +241,10 @@ fn run_cycle(
     if use_idle_tracking {
         info!("  Scanning {} eligible processes...", eligible.len());
         for proc_info in &eligible {
+            if shutdown.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
             let regions =
                 match scanner::scan_memory_regions(proc_info.pid, config.min_region_kib) {
                     Ok(r) => r,
