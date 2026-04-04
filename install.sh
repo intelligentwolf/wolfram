@@ -44,21 +44,13 @@ detect_platform() {
         *)               PLATFORM="" ;;
     esac
 
-    # Detect musl vs glibc.
-    if ldd --version 2>&1 | grep -qi musl; then
-        LIBC="musl"
-    else
-        LIBC="gnu"
-    fi
-
-    case "${PLATFORM}-${LIBC}" in
-        x86_64-gnu)   ARTIFACT="wolfram-x86_64-linux-gnu" ;;
-        x86_64-musl)  ARTIFACT="wolfram-x86_64-linux-musl" ;;
-        aarch64-gnu)  ARTIFACT="wolfram-aarch64-linux-gnu" ;;
-        aarch64-musl) ARTIFACT="wolfram-aarch64-linux-musl" ;;
-        armv7-gnu)    ARTIFACT="wolfram-armv7-linux-gnueabihf" ;;
-        armv7-musl)   ARTIFACT="wolfram-armv7-linux-musleabihf" ;;
-        *)            ARTIFACT="" ;;
+    # Always use musl (static) builds — they work on every Linux distro
+    # regardless of glibc version. Zero dependencies.
+    case "$PLATFORM" in
+        x86_64)   ARTIFACT="wolfram-x86_64-linux-musl" ;;
+        aarch64)  ARTIFACT="wolfram-aarch64-linux-musl" ;;
+        armv7)    ARTIFACT="wolfram-armv7-linux-musleabihf" ;;
+        *)        ARTIFACT="" ;;
     esac
 }
 

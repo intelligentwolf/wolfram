@@ -6,7 +6,7 @@ mod idle_tracker;
 mod scanner;
 mod stats;
 
-use log::{error, info};
+use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -39,6 +39,7 @@ fn main() {
     }
 
     print_system_info();
+    ensure_zswap();
 
     // Set up signal handler for graceful shutdown.
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -130,4 +131,32 @@ fn print_system_info() {
             "not found"
         }
     );
+}
+
+/// Enable zswap if it's available but not turned on.
+fn ensure_zswap() {
+    if compressor::zswap_enabled() {
+        return;
+    }
+
+    let param = std::path::Path::new("/sys/module/zswap/parameters/enabled");
+    if !param.exists() {
+        warn!("zswap not available in this kernel — compressed pages will go to disk swap");
+        return;
+    }
+
+    info!("Enabling zswap...");
+    match std::fs::write(param, "Y") {
+        Ok(()) => {
+            if compressor::zswap_enabled() {
+                info!("  zswap enabled — compressed pages stay in RAM");
+            } else {
+                warn!("  Wrote to zswap parameter but it didn't take effect");
+            }
+        }
+        Err(e) => {
+            warn!("  Could not enable zswap: {e}");
+            warn!("  Compressed pages will go to disk swap (slower but still works)");
+        }
+    }
 }
