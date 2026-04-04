@@ -83,8 +83,11 @@ impl ZramManager {
         // Just create our first device.
         self.add_device()?;
 
-        // Set swappiness so the kernel actually uses swap.
-        set_swappiness(60);
+        // With zram, "swap" is compressed RAM — not disk. A page fault on zram
+        // decompresses in microseconds (same as L3 cache miss). High swappiness is
+        // safe and desirable: the kernel actively compresses cold pages, freeing RAM.
+        // Android runs at 100-200 on every phone. We use 100.
+        set_swappiness(100);
 
         info!(
             "zram initialised: {} MiB device, max {} MiB total ({:.0}% of RAM), swappiness=60",
