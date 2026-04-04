@@ -15,16 +15,24 @@ use std::path::Path;
 use crate::scanner::MemoryRegion;
 
 // Syscall numbers vary by architecture.
-// x86_64: from arch/x86/entry/syscalls/syscall_64.tbl
+// Sources: arch/x86/entry/syscalls/syscall_64.tbl,
+//          arch/arm/tools/syscall.tbl,
+//          include/uapi/asm-generic/unistd.h
+
 #[cfg(target_arch = "x86_64")]
 const SYS_PROCESS_MADVISE: libc::c_long = 440;
 #[cfg(target_arch = "x86_64")]
 const SYS_PIDFD_OPEN: libc::c_long = 434;
 
-// aarch64: from include/uapi/asm-generic/unistd.h
 #[cfg(target_arch = "aarch64")]
-const SYS_PROCESS_MADVISE: libc::c_long = 233;
+const SYS_PROCESS_MADVISE: libc::c_long = 440;
 #[cfg(target_arch = "aarch64")]
+const SYS_PIDFD_OPEN: libc::c_long = 434;
+
+// ARM (32-bit): from arch/arm/tools/syscall.tbl
+#[cfg(target_arch = "arm")]
+const SYS_PROCESS_MADVISE: libc::c_long = 440;
+#[cfg(target_arch = "arm")]
 const SYS_PIDFD_OPEN: libc::c_long = 434;
 
 const MADV_COLD: i32 = 20;
