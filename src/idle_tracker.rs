@@ -118,6 +118,11 @@ pub fn check_idle(marked: &MarkedRegion) -> Result<IdleResult> {
     })
 }
 
+// Max pagemap read per region: 8MB buffer = 1M pages = 4GB of virtual address space.
+// Regions larger than this are read in chunks. This prevents multi-GB allocations
+// for processes with huge virtual address spaces (common on large-RAM servers).
+const MAX_PAGEMAP_READ: u64 = 1024 * 1024; // pages per chunk
+
 /// Collect physical page frame numbers for a region by reading pagemap.
 fn collect_pfns(pid: u32, region: &MemoryRegion) -> Result<Vec<(u64, u64)>> {
     let pagemap_path = format!("/proc/{pid}/pagemap");
@@ -126,38 +131,53 @@ fn collect_pfns(pid: u32, region: &MemoryRegion) -> Result<Vec<(u64, u64)>> {
 
     let start_page = region.start / PAGE_SIZE;
     let end_page = region.end / PAGE_SIZE;
-    let num_pages = end_page - start_page;
+    let total_pages = end_page - start_page;
 
-    if num_pages == 0 {
+    if total_pages == 0 {
         return Ok(Vec::new());
     }
 
-    let offset = start_page * PAGEMAP_ENTRY_SIZE;
-    pagemap.seek(SeekFrom::Start(offset))?;
-
-    let buf_size = (num_pages * PAGEMAP_ENTRY_SIZE) as usize;
-    let mut buf = vec![0u8; buf_size];
-
-    // read_exact may fail if the process vanishes mid-read; that's OK.
-    if pagemap.read_exact(&mut buf).is_err() {
+    // Estimate: RSS pages / virtual pages gives residency ratio.
+    // If virtual span is huge but RSS is tiny, most reads will be zeros.
+    // Skip regions where virtual span is >100x the RSS — not worth the I/O.
+    let rss_pages = region.rss_kib * 1024 / PAGE_SIZE;
+    if rss_pages > 0 && total_pages > rss_pages * 100 {
         return Ok(Vec::new());
     }
 
-    let mut pfns = Vec::with_capacity(num_pages as usize / 4); // not all pages are resident
-    for i in 0..num_pages {
-        let entry_offset = (i * PAGEMAP_ENTRY_SIZE) as usize;
-        let entry = u64::from_le_bytes(
-            buf[entry_offset..entry_offset + 8]
-                .try_into()
-                .unwrap(),
-        );
+    let mut pfns = Vec::with_capacity(rss_pages.min(65536) as usize);
 
-        if entry & PM_PRESENT != 0 {
-            let pfn = entry & PM_PFN_MASK;
-            if pfn > 0 {
-                pfns.push((start_page + i, pfn));
+    // Read pagemap in chunks to avoid huge allocations.
+    let mut page_offset = start_page;
+    while page_offset < end_page {
+        let chunk_pages = (end_page - page_offset).min(MAX_PAGEMAP_READ);
+        let file_offset = page_offset * PAGEMAP_ENTRY_SIZE;
+        pagemap.seek(SeekFrom::Start(file_offset))?;
+
+        let buf_size = (chunk_pages * PAGEMAP_ENTRY_SIZE) as usize;
+        let mut buf = vec![0u8; buf_size];
+
+        if pagemap.read_exact(&mut buf).is_err() {
+            break; // process vanished mid-read
+        }
+
+        for i in 0..chunk_pages {
+            let entry_offset = (i * PAGEMAP_ENTRY_SIZE) as usize;
+            let entry = u64::from_le_bytes(
+                buf[entry_offset..entry_offset + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+
+            if entry & PM_PRESENT != 0 {
+                let pfn = entry & PM_PFN_MASK;
+                if pfn > 0 {
+                    pfns.push((page_offset + i, pfn));
+                }
             }
         }
+
+        page_offset += chunk_pages;
     }
 
     Ok(pfns)

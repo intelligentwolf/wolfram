@@ -230,10 +230,11 @@ fn run_cycle(
         .filter(|p| !is_excluded(p, config))
         .collect();
 
-    // Step 2: Mark all regions idle across all processes (fast — no sleeping).
+    // Step 2: Mark all regions idle across all processes.
     let mut all_marked: Vec<(u32, MarkedRegion)> = Vec::new();
 
     if use_idle_tracking {
+        info!("  Scanning {} eligible processes...", eligible.len());
         for proc_info in &eligible {
             let regions =
                 match scanner::scan_memory_regions(proc_info.pid, config.min_region_kib) {
