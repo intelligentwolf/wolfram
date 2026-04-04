@@ -3,9 +3,7 @@
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/wolfsoftwaresystemsltd?label=Sponsor&logo=GitHub)](https://github.com/sponsors/wolfsoftwaresystemsltd)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Proactive memory compression daemon for Linux. Wolfram identifies cold memory pages across all processes, compresses them in RAM using zram, and dynamically grows/shrinks its compressed pool based on demand. No disk I/O. Applications keep running normally and never know it's happening.
-
-Optionally, completely idle processes can be hibernated to disk using CRIU and transparently restored when someone connects to their port.
+Proactive memory compression daemon for Linux. Wolfram identifies cold memory pages across all processes, compresses them in RAM using zram, deduplicates identical pages with KSM, and tunes kernel parameters — all automatically. No disk I/O. Applications keep running normally and never know it's happening.
 
 ## How it works
 
@@ -15,49 +13,59 @@ Optionally, completely idle processes can be hibernated to disk using CRIU and t
     │  Hot pages (actively used)         80 GB     │
     │  Cold pages (untouched)            48 GB ──┐ │
     │                                            │ │
+    │  KSM dedup (identical pages merged) -17 GB │ │
     │  zram (compressed in RAM)     ┌────────────┘ │
-    │  48 GB compressed to ~20 GB   │  20 GB       │
+    │  31 GB compressed to ~12 GB   │  12 GB       │
     │                               └──────────    │
-    │  Free (reclaimed by wolfram)       28 GB     │
+    │  Free (reclaimed by wolfram)       36 GB     │
     └──────────────────────────────────────────────┘
 ```
 
-Each cycle:
+Wolfram does three things simultaneously:
 
+### 1. Page compression (zram)
+
+Each cycle:
 1. **Scan** `/proc` for processes with significant anonymous memory
 2. **Mark** all their pages as idle via `/sys/kernel/mm/page_idle/bitmap`
-3. **Wait** 30 seconds (configurable)
-4. **Check** which pages are still idle — these haven't been touched
-5. **Compress** idle pages using `process_madvise()`:
-   - 50%+ idle → `MADV_COLD` (kernel deprioritizes, compresses when convenient)
-   - 70%+ idle for 2+ cycles → `MADV_PAGEOUT` (compress into zram immediately)
-6. **Adjust** zram pool — grow if >80% full and RAM is available, shrink if <40% used
-7. Write stats to `/var/lib/wolfram/stats.json`
-8. Repeat
+3. **Wait** 30 seconds, then **check** which pages are still idle
+4. **Compress** idle pages using `process_madvise()` into zram (compressed RAM)
+5. **Adjust** zram pool — grow if >80% full, shrink if <40% used
 
-### Dynamic zram
+Wolfram creates and manages zram compressed swap devices entirely in RAM:
+- **Starts small** (3% of RAM), **grows on demand**, **shrinks when idle**
+- **Caps at 50% of RAM** — always leaves headroom for active workloads
+- **lz4 compression** — typically 2-4x ratio
+- **Zero disk I/O** — compressed pages never touch disk
+- Sets **swappiness=100** — safe with zram because "swap" is just compressed RAM with microsecond access times (same approach Android uses on every phone)
 
-Wolfram creates and manages its own zram compressed swap devices entirely in RAM — no disk swap files needed.
+### 2. Page deduplication (KSM)
 
-- **Starts small**: creates an initial zram device (3% of RAM)
-- **Grows on demand**: if zram is >80% full and free RAM exists, adds another device
-- **Shrinks when idle**: if utilisation drops below 40%, removes the newest device
-- **Caps at 50% of RAM**: never overcommits — always leaves headroom for active workloads
-- **Uses lz4 compression**: fast, typically 2-3x compression ratio
-- **Kernel load-balances** across multiple zram swap devices automatically
-- **Zero disk I/O**: compressed pages never touch disk. Ever.
+Wolfram auto-enables KSM (Kernel Same-page Merging) if available. KSM finds identical pages across all processes and merges them into a single shared copy. Massive savings when running many instances of the same runtime:
 
-This is the same approach Android uses on every phone on the planet.
+- 80 .NET (OpenSim) processes: **~17 GB deduplicated**
+- Multiple Electron apps (VS Code, Slack, Discord): **hundreds of MiB**
+- Docker containers from the same image: **significant overlap**
+
+KSM works alongside compression — first dedup, then compress what's left.
+
+### 3. Kernel tuning
+
+On startup, wolfram optimises kernel memory management parameters (skipped gracefully if not available on a given kernel):
+
+- **`vfs_cache_pressure=200`** — reclaim stale filesystem cache faster
+- **`compaction_proactiveness=0`** — stop wasting CPU building huge pages
+- **`watermark_boost_factor=0`** — no over-reclaim with zram available
 
 ### CPU priority
 
-Wolfram runs at the absolute lowest CPU and I/O priority:
+Wolfram runs at the absolute lowest priority:
 
-- **nice 19** — lowest scheduling priority
+- **nice 19** — lowest CPU scheduling priority
 - **SCHED_IDLE** — kernel only runs wolfram when nothing else wants the CPU
 - **ionice idle** — only uses disk I/O when disk is idle
 
-On a busy server or Raspberry Pi, wolfram will never compete with real workloads. It runs in the gaps when the CPU would otherwise be idle.
+On a busy server or Raspberry Pi, wolfram never competes with real workloads.
 
 ## Will this affect my applications?
 
@@ -79,8 +87,6 @@ CRIU-based hibernation kills the process after checkpointing it. When restored:
 - File locks are lost
 - Not all applications survive checkpoint/restore (GPU state, certain socket types)
 - Test thoroughly with your specific applications before enabling in production
-
-Hibernation is designed for scenarios like OpenSim grids where many region processes sit completely idle for hours or days.
 
 ## Requirements
 
@@ -105,13 +111,15 @@ That's it. The installer:
 |-------------|-----------|--------|
 | **Proxmox VE** | `/etc/pve` or `pvesh` | 5min cycles, 100MB+ processes, excludes pvedaemon/pveproxy/qemu/lxc-start/ceph |
 | **Kubernetes** | `kubelet` present | 5min cycles, 100MB+ processes, excludes kubelet/kube-proxy/etcd/calico |
-| **Docker host** | `dockerd` running | 3min cycles, 50MB+ processes, excludes dockerd/containerd |
+| **Desktop** | Running WM detected (KDE, GNOME, Hyprland, Sway, etc.) | 2min cycles, excludes display server/audio/WM |
+| **Docker host** | `dockerd` running (headless) | 3min cycles, 50MB+ processes, excludes dockerd/containerd |
 | **Raspberry Pi** | `/proc/cpuinfo` | 5min cycles, 10MB+ processes, tuned for low memory |
-| **Desktop** | Xorg/Wayland present | 2min cycles, excludes display server/audio/WM |
 | **Server** | Default | 2min cycles, standard defaults |
 
 3. **Loads the zram kernel module** if not already loaded
 4. **Enables and starts** the systemd service immediately
+
+On startup, wolfram automatically enables KSM, creates zram devices, tunes kernel parameters, and begins compressing — no manual configuration needed.
 
 No Rust toolchain needed. All builds are fully static (musl) — zero dependencies, works on any Linux distribution.
 
@@ -182,12 +190,16 @@ Wolfram writes current memory savings to `/var/lib/wolfram/stats.json` once per 
   "saved_bytes": 5153960756,
   "compression_ratio": 2.5,
   "zram_devices": 2,
+  "ksm_pages_sharing": 4490362,
+  "ksm_saved_mib": 17430,
   "hibernated_processes": 0,
   "hibernated_saved_mib": 0,
-  "total_saved_mib": 4915,
+  "total_saved_mib": 22345,
   "lifetime_compressed_kib": 30720000
 }
 ```
+
+`total_saved_mib` includes zram compression + KSM deduplication + hibernation.
 
 Quick check:
 ```bash
@@ -197,6 +209,9 @@ jq .total_saved_mib /var/lib/wolfram/stats.json
 # Compression ratio
 jq .compression_ratio /var/lib/wolfram/stats.json
 
+# KSM deduplication savings
+jq .ksm_saved_mib /var/lib/wolfram/stats.json
+
 # Watch it update
 watch -n 60 cat /var/lib/wolfram/stats.json
 ```
@@ -205,7 +220,7 @@ watch -n 60 cat /var/lib/wolfram/stats.json
 
 ```
 src/
-├── main.rs           Entry point, signal handling, priority setup
+├── main.rs           Entry point, signal handling, priority, kernel tuning, KSM
 ├── config.rs         TOML config file + clap CLI arguments
 ├── scanner.rs        Reads /proc for processes and memory regions
 ├── idle_tracker.rs   Page idle bitmap — mark pages, check which stayed idle
@@ -215,6 +230,14 @@ src/
 ├── stats.rs          Writes memory savings to stats.json each cycle
 └── daemon.rs         Main loop: scan → mark → wait → check → compress → adjust zram → stats
 ```
+
+### What wolfram does on startup
+
+1. Sets CPU priority to nice 19 / SCHED_IDLE / ionice idle
+2. Tunes kernel: cache pressure, compaction, watermark boost
+3. Enables KSM if not already running
+4. Creates initial zram device, disables zswap (conflicts with zram), sets swappiness=100
+5. Enters main compression loop
 
 ### Kernel APIs used
 
@@ -227,17 +250,17 @@ src/
 | `pidfd_open()` | Get a file descriptor for a process | Yes |
 | `/sys/class/zram-control` | Create/remove zram compressed swap devices | Yes (for zram) |
 | `/sys/block/zramN/mm_stat` | Read per-device compression statistics | Yes (for zram) |
+| `/sys/kernel/mm/ksm/` | Enable and read KSM deduplication stats | Optional |
 
 ## Graduated memory management
 
-Wolfram applies increasing levels of intervention:
-
 | Level | Trigger | Action | RAM saved | Impact |
 |-------|---------|--------|-----------|--------|
-| **Cold** | 50%+ pages idle | `MADV_COLD` — deprioritize | Gradual | None — kernel compresses when convenient |
-| **Page out** | 70%+ idle, 2+ cycles | `MADV_PAGEOUT` — compress into zram now | Immediate | Microsecond decompression on access |
-| **zram grow** | zram >80% full, free RAM available | Add another zram device | More capacity | None — kernel handles it |
-| **zram shrink** | zram <40% used, 2+ devices | Remove newest device | Returns RAM | None — kernel migrates pages |
+| **KSM dedup** | Identical pages across processes | Merge into single shared copy | Immediate | None |
+| **Cold** | 50%+ pages idle | `MADV_COLD` — deprioritize | Gradual | None |
+| **Page out** | 70%+ idle, 2+ cycles | `MADV_PAGEOUT` — compress into zram | Immediate | Microsecond decompression on access |
+| **zram grow** | zram >80% full, free RAM available | Add another zram device | More capacity | None |
+| **zram shrink** | zram <40% used, 2+ devices | Remove newest device | Returns RAM | None |
 | **Hibernate** | All regions idle, 10+ cycles | CRIU checkpoint + kill | 100% of process | Seconds to restore; test your apps |
 
 ## LXC / Containers / VMs
@@ -259,6 +282,7 @@ The installer automatically detects Proxmox, Docker, and Kubernetes environments
 - **Graceful shutdown**: On SIGTERM/SIGINT, cleans up zram devices and restores any hibernated processes.
 - **Dry-run mode**: `--dry-run` lets you see what would happen without any changes.
 - **Dynamic sizing**: zram pool grows and shrinks automatically — never overcommits RAM.
+- **Respects admin intent**: Won't re-enable zswap if explicitly disabled via kernel cmdline.
 
 ## License
 
