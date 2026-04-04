@@ -330,9 +330,18 @@ fn find_listening_ports(pid: u32) -> Vec<u16> {
 
 /// Check if CRIU is available.
 pub fn is_supported() -> bool {
-    Command::new("criu")
-        .arg("check")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    // Just check if the binary exists — don't run "criu check" as it can
+    // hang on some systems (e.g., Proxmox with partial criu install).
+    which_criu().is_some()
+}
+
+fn which_criu() -> Option<std::path::PathBuf> {
+    let paths = std::env::var("PATH").ok()?;
+    for dir in paths.split(':') {
+        let candidate = std::path::Path::new(dir).join("criu");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
