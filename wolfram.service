@@ -2,6 +2,8 @@
 Description=Wolfram — proactive memory compression daemon
 Documentation=https://github.com/wolfsoftwaresystemsltd/wolfram
 After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=120
 
 [Service]
 Type=simple
@@ -11,8 +13,6 @@ IOSchedulingClass=idle
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=60
-StartLimitBurst=5
-StartLimitIntervalSec=120
 
 # Wolfram needs root for /proc/[pid]/pagemap, page_idle bitmap,
 # and process_madvise(). Runs as root intentionally.
