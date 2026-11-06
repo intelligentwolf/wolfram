@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::compressor;
+use crate::daemon::Lifetime;
 use crate::hibernator::HibernationStats;
 use crate::zram::ZramManager;
 
@@ -48,8 +49,15 @@ pub struct Stats {
     // -- Totals --
     /// Total RAM currently being saved (MiB) — compression + KSM + hibernation.
     pub total_saved_mib: u64,
-    /// Total KiB pushed to compression over lifetime.
+    /// KiB verified to have left RAM for compressed swap after MADV_PAGEOUT,
+    /// over the daemon's lifetime. (Name kept for existing readers; before
+    /// v0.3.0 this counted every byte advised, cold or not, every cycle.)
     pub lifetime_compressed_kib: u64,
+    /// KiB of those paged-out pages found back in RAM one cycle later.
+    /// Close to lifetime_compressed_kib means page-outs are not sticking.
+    pub lifetime_refaulted_kib: u64,
+    /// KiB given MADV_COLD advice (deprioritised, not necessarily swapped).
+    pub lifetime_cold_advised_kib: u64,
 }
 
 pub struct StatsTracker {
@@ -70,7 +78,7 @@ impl StatsTracker {
     pub fn write(
         &self,
         cycle_count: u64,
-        lifetime_compressed_kib: u64,
+        lifetime: &Lifetime,
         hibernation: &HibernationStats,
         zram_mgr: &ZramManager,
     ) {
@@ -122,7 +130,9 @@ impl StatsTracker {
             hibernated_processes: hibernation.hibernated,
             hibernated_saved_mib: hibernation.saved_mib,
             total_saved_mib,
-            lifetime_compressed_kib,
+            lifetime_compressed_kib: lifetime.paged_out_kib,
+            lifetime_refaulted_kib: lifetime.refaulted_kib,
+            lifetime_cold_advised_kib: lifetime.cold_advised_kib,
         };
 
         match serde_json::to_string_pretty(&stats) {

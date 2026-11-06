@@ -39,6 +39,14 @@ if systemctl is-enabled --quiet wolfram 2>/dev/null; then
     systemctl disable wolfram
 fi
 
+# Put back the kernel values Wolfram changed (normally already done by the
+# unit's ExecStopPost; this covers older units and a stopped-but-unrestored
+# state).
+if [ -x "$INSTALL_BIN" ]; then
+    info "Restoring kernel tuning changed by wolfram..."
+    "$INSTALL_BIN" --restore-tuning || warn "Could not restore kernel tuning — check $DATA_DIR/original-tuning.json"
+fi
+
 # Remove service file.
 if [ -f "$SERVICE_FILE" ]; then
     info "Removing $SERVICE_FILE"

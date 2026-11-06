@@ -171,7 +171,10 @@ sudo systemctl restart wolfram
 | `hibernate_after_cycles` | 10 | Fully-idle cycles before hibernating a process |
 | `enable_port_proxy` | false | Listen on hibernated process ports for wake-on-connect |
 | `excluded_names` | (varies by environment) | Process names to never touch (substring match, max 15 chars) |
-| `dry_run` | false | Scan and report without modifying anything |
+| `dry_run` | false | Scan and report without modifying anything (no advice, no zram, no kernel tuning) |
+| `skip_gpu_processes` | true | Never touch a process holding `/dev/dri`, `/dev/kfd`, `/dev/nvidia*` or `/dev/accel` open |
+| `refault_backoff_threshold` | 0.25 | If this fraction of a region's paged-out pages is back in RAM one cycle later, the region is hot |
+| `refault_backoff_cycles` | 10 | Cycles a hot (refaulting) region is left alone |
 
 CLI arguments override config file values. Config file overrides defaults.
 
@@ -195,9 +198,13 @@ Wolfram writes current memory savings to `/var/lib/wolfram/stats.json` once per 
   "hibernated_processes": 0,
   "hibernated_saved_mib": 0,
   "total_saved_mib": 22345,
-  "lifetime_compressed_kib": 30720000
+  "lifetime_compressed_kib": 30720000,
+  "lifetime_refaulted_kib": 409600,
+  "lifetime_cold_advised_kib": 5120000
 }
 ```
+
+`lifetime_compressed_kib` counts only pages verified to be in swap after `MADV_PAGEOUT`. `lifetime_refaulted_kib` counts those that were back in RAM one cycle later; if it approaches `lifetime_compressed_kib`, page-outs are not sticking (the refault back-off should then be kicking in — check the log). Before v0.3.0 `lifetime_compressed_kib` summed every byte advised every cycle, including `MADV_COLD`, so it greatly overstated real page-outs.
 
 `total_saved_mib` includes zram compression + KSM deduplication + hibernation.
 
@@ -239,6 +246,10 @@ src/
 4. Creates initial zram device, disables zswap (conflicts with zram), sets swappiness=100
 5. Enters main compression loop
 
+Every kernel value changed in steps 2-4 is first recorded in `/var/lib/wolfram/original-tuning.json` and put back on stop: by the daemon's own shutdown path, and by the unit's `ExecStopPost=wolfram --restore-tuning` if the daemon crashed or was killed. `uninstall.sh` runs the same restore.
+
+**Upgrading from v0.2.x without a reboot:** v0.2.x never recorded the originals, so a host upgraded in place is still carrying v0.2.x's values and v0.3.0 has nothing to restore them from. Reboot once after upgrading (the values Wolfram then records are the real boot-time ones), or set them back by hand before restarting the service.
+
 ### Kernel APIs used
 
 | API | Purpose | Required |
@@ -257,8 +268,9 @@ src/
 | Level | Trigger | Action | RAM saved | Impact |
 |-------|---------|--------|-----------|--------|
 | **KSM dedup** | Identical pages across processes | Merge into single shared copy | Immediate | None |
-| **Cold** | 50%+ pages idle | `MADV_COLD` — deprioritize | Gradual | None |
-| **Page out** | 70%+ idle, 2+ cycles | `MADV_PAGEOUT` — compress into zram | Immediate | Microsecond decompression on access |
+| **Cold** | 50%+ pages idle | `MADV_COLD` on the idle pages only — deprioritize | Gradual | None |
+| **Page out** | 70%+ idle, 2+ cycles | `MADV_PAGEOUT` on the idle pages only — compress into zram | Immediate | Microsecond decompression on access |
+| **Refault back-off** | 25%+ of last cycle's page-outs back in RAM | Leave the region alone for 10 cycles | — | Stops page-out/refault churn |
 | **zram grow** | zram >80% full, free RAM available | Add another zram device | More capacity | None |
 | **zram shrink** | zram <40% used, 2+ devices | Remove newest device | Returns RAM | None |
 | **Hibernate** | All regions idle, 10+ cycles | CRIU checkpoint + kill | 100% of process | Seconds to restore; test your apps |
@@ -278,8 +290,9 @@ The installer automatically detects Proxmox, Docker, and Kubernetes environments
 - **Non-destructive**: Wolfram never modifies process memory, code, or state. Compression uses the same kernel path as normal memory pressure.
 - **Transparent**: Compressed pages are decompressed by the kernel on access. Applications never know.
 - **Low priority**: Runs at nice 19 / SCHED_IDLE / ionice idle — never competes with real workloads for CPU or I/O.
-- **Smart exclusions**: Infrastructure processes (systemd, sshd, dockerd, kubelet, etcd, pvedaemon, etc.) are excluded by default.
-- **Graceful shutdown**: On SIGTERM/SIGINT, cleans up zram devices and restores any hibernated processes.
+- **Smart exclusions**: Infrastructure processes (systemd, sshd, dockerd, kubelet, etcd, pvedaemon, etc.), databases (postgres, mysqld, mariadbd) and LLM servers (ollama, llama-server) are excluded by default. Processes holding a GPU/accelerator device open are skipped automatically.
+- **Only ordinary private memory**: shared mappings (SysV shm, memfd, shared `/dev/zero`), locked (`mlock`), MMIO, PFN-mapped and hugetlb regions are never advised.
+- **Graceful shutdown**: On SIGTERM/SIGINT, cleans up zram devices, restores any hibernated processes, and puts back every kernel value it changed.
 - **Dry-run mode**: `--dry-run` lets you see what would happen without any changes.
 - **Dynamic sizing**: zram pool grows and shrinks automatically — never overcommits RAM.
 - **Respects admin intent**: Won't re-enable zswap if explicitly disabled via kernel cmdline.

@@ -15,6 +15,13 @@ use log::{debug, info, warn};
 use std::fs;
 use std::path::Path;
 
+use crate::tuning::Tuning;
+
+/// vm.swappiness while zram is the swap device. A zram fault decompresses in
+/// microseconds, so the kernel may favour swapping anonymous pages over
+/// dropping file cache. Restored to the original on shutdown.
+const ZRAM_SWAPPINESS: u32 = 100;
+
 /// Manages zram compressed swap devices.
 pub struct ZramManager {
     /// zram device indices we've created.
@@ -59,14 +66,7 @@ impl ZramManager {
     }
 
     /// Set up initial zram. Disables zswap (conflicts), creates first device.
-    pub fn init(&mut self) -> Result<()> {
-        // Disable zswap — it conflicts with zram.
-        let zswap_param = Path::new("/sys/module/zswap/parameters/enabled");
-        if zswap_param.exists() {
-            fs::write(zswap_param, "N").ok();
-            debug!("Disabled zswap (using zram instead)");
-        }
-
+    pub fn init(&mut self, tuning: &mut Tuning) -> Result<()> {
         // Check if zram module is available.
         if !Path::new("/sys/class/zram-control").exists() {
             // Try to load the module.
@@ -81,16 +81,30 @@ impl ZramManager {
 
         // Remove any existing zram swap devices we don't own, but don't touch them.
         // Just create our first device.
-        self.add_device()?;
+        self.add_device(tuning)?;
+
+        // Disable zswap — it conflicts with zram. Only now that a zram device
+        // exists: if creation failed above, the daemon falls back to zswap,
+        // which must still be on. Restored on shutdown.
+        match tuning.set("/sys/module/zswap/parameters/enabled", "N") {
+            Ok(true) => debug!("Disabled zswap (using zram instead)"),
+            Ok(false) => {}
+            Err(e) => warn!("Could not disable zswap: {e:#}"),
+        }
 
         // With zram, "swap" is compressed RAM — not disk. A page fault on zram
         // decompresses in microseconds (same as L3 cache miss). High swappiness is
         // safe and desirable: the kernel actively compresses cold pages, freeing RAM.
         // Android runs at 100-200 on every phone. We use 100.
-        set_swappiness(100);
+        if let Err(e) = tuning.set("/proc/sys/vm/swappiness", &ZRAM_SWAPPINESS.to_string()) {
+            warn!("Could not set vm.swappiness={ZRAM_SWAPPINESS}: {e:#}");
+        }
+        let swappiness = fs::read_to_string("/proc/sys/vm/swappiness")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "unknown".into());
 
         info!(
-            "zram initialised: {} MiB device, max {} MiB total ({:.0}% of RAM), swappiness=60",
+            "zram initialised: {} MiB device, max {} MiB total ({:.0}% of RAM), swappiness={swappiness}",
             self.device_size_bytes / (1024 * 1024),
             self.max_total_bytes / (1024 * 1024),
             (self.max_total_bytes as f64 / self.total_ram_bytes as f64) * 100.0,
@@ -101,7 +115,7 @@ impl ZramManager {
 
     /// Check if zram needs growing. Call once per cycle.
     /// Adds a new device if current zram is >80% full and there's enough free RAM.
-    pub fn maybe_grow(&mut self) {
+    pub fn maybe_grow(&mut self, tuning: &mut Tuning) {
         if self.devices.is_empty() {
             return;
         }
@@ -139,7 +153,7 @@ impl ZramManager {
             free / (1024 * 1024),
         );
 
-        if let Err(e) = self.add_device() {
+        if let Err(e) = self.add_device(tuning) {
             warn!("Failed to add zram device: {e}");
         }
     }
@@ -187,7 +201,7 @@ impl ZramManager {
 
     /// Shrink zram if we have more capacity than needed. Call once per cycle.
     /// Removes the newest device if it's <20% utilised and we have 2+ devices.
-    pub fn maybe_shrink(&mut self) {
+    pub fn maybe_shrink(&mut self, tuning: &mut Tuning) {
         if self.devices.len() < 2 {
             return;
         }
@@ -228,7 +242,9 @@ impl ZramManager {
 
         match result {
             Ok(o) if o.status.success() => {
-                fs::write("/sys/class/zram-control/hot_remove", idx.to_string()).ok();
+                if fs::write("/sys/class/zram-control/hot_remove", idx.to_string()).is_ok() {
+                    tuning.forget_zram(idx);
+                }
                 self.devices.pop();
                 info!(
                     "  Removed — {} devices remaining, {} MiB capacity",
@@ -243,12 +259,15 @@ impl ZramManager {
     }
 
     /// Create a new zram device and enable it as swap.
-    fn add_device(&mut self) -> Result<()> {
+    fn add_device(&mut self, tuning: &mut Tuning) -> Result<()> {
         // Ask the kernel for a new zram device.
         let idx_str = fs::read_to_string("/sys/class/zram-control/hot_add")
             .context("creating zram device — is the zram module loaded?")?;
         let idx: u32 = idx_str.trim().parse()
             .with_context(|| format!("parsing zram device index: {idx_str:?}"))?;
+        // Record it before using it, so a crash at any later step still
+        // leaves it on the list for --restore-tuning / the next start.
+        tuning.record_zram(idx);
 
         let dev = format!("/dev/zram{idx}");
         let sys = format!("/sys/block/zram{idx}");
@@ -294,17 +313,22 @@ impl ZramManager {
     }
 
     /// Clean up all zram devices (for shutdown).
-    pub fn cleanup(&mut self) {
+    pub fn cleanup(&mut self, tuning: &mut Tuning) {
         for &idx in self.devices.iter().rev() {
             let dev = format!("/dev/zram{idx}");
             // swapoff first.
-            std::process::Command::new("swapoff")
-                .arg(&dev)
-                .output()
-                .ok();
+            let off = std::process::Command::new("swapoff").arg(&dev).output();
+            if !matches!(&off, Ok(o) if o.status.success()) {
+                warn!("swapoff {dev} failed — pages may still be in use");
+            }
             // Remove the device.
-            fs::write("/sys/class/zram-control/hot_remove", idx.to_string()).ok();
-            debug!("Removed zram{idx}");
+            match fs::write("/sys/class/zram-control/hot_remove", idx.to_string()) {
+                Ok(()) => {
+                    tuning.forget_zram(idx);
+                    debug!("Removed zram{idx}");
+                }
+                Err(e) => warn!("Could not remove zram{idx}: {e} (left recorded for --restore-tuning)"),
+            }
         }
         self.devices.clear();
     }
@@ -342,13 +366,6 @@ fn read_meminfo_kb(key: &str) -> Option<u64> {
         }
     }
     None
-}
-
-fn set_swappiness(val: u32) {
-    let path = "/proc/sys/vm/swappiness";
-    if let Err(e) = fs::write(path, val.to_string()) {
-        warn!("Could not set vm.swappiness={val}: {e}");
-    }
 }
 
 fn read_sysfs_u64(path: &str) -> Option<u64> {

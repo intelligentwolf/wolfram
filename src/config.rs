@@ -69,6 +69,12 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
+    /// Restore the kernel values a previous run changed (from
+    /// /var/lib/wolfram/original-tuning.json) and exit. Used by the systemd
+    /// unit's ExecStopPost and by uninstall.sh.
+    #[arg(long)]
+    restore_tuning: bool,
+
     /// Increase log verbosity (use -v, -vv, -vvv)
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -92,6 +98,9 @@ struct FileConfig {
     excluded_names: Option<Vec<String>>,
     excluded_pids: Option<Vec<u32>>,
     dry_run: Option<bool>,
+    skip_gpu_processes: Option<bool>,
+    refault_backoff_threshold: Option<f64>,
+    refault_backoff_cycles: Option<u32>,
 }
 
 /// Resolved runtime configuration.
@@ -111,6 +120,28 @@ pub struct Config {
     pub excluded_names: Vec<String>,
     pub excluded_pids: Vec<u32>,
     pub dry_run: bool,
+    /// Leave alone any process holding a GPU / accelerator device open
+    /// (/dev/dri, /dev/kfd, /dev/nvidia*, /dev/accel). Their host-side
+    /// buffers are ordinary anonymous memory the device reads directly, so
+    /// paging them out only forces driver refaults.
+    pub skip_gpu_processes: bool,
+    /// If at least this fraction of the pages a region had paged out are back
+    /// in RAM one cycle later, the region is hot: stop advising it.
+    pub refault_backoff_threshold: f64,
+    /// How many cycles a region that refaulted is left alone.
+    pub refault_backoff_cycles: u32,
+    /// `--restore-tuning`: restore recorded kernel values and exit.
+    pub restore_tuning_only: bool,
+}
+
+impl Config {
+    /// Directory for stats.json and original-tuning.json.
+    pub fn state_dir(&self) -> PathBuf {
+        self.checkpoint_dir
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/var/lib/wolfram"))
+    }
 }
 
 impl Default for Config {
@@ -156,9 +187,21 @@ impl Default for Config {
                 // Storage
                 "ceph-osd".into(),
                 "ceph-mon".into(),
+                // Latency-sensitive databases and inference servers: their
+                // "idle" pages are caches and model weights that come back
+                // on the next query. ("llama" also matches ollama and
+                // llama-server.)
+                "postgres".into(),
+                "mysqld".into(),
+                "mariadbd".into(),
+                "llama".into(),
             ],
             excluded_pids: vec![1],
             dry_run: false,
+            skip_gpu_processes: true,
+            refault_backoff_threshold: 0.25,
+            refault_backoff_cycles: 10,
+            restore_tuning_only: false,
         }
     }
 }
@@ -185,11 +228,29 @@ pub fn load() -> Result<(Config, String)> {
         PathBuf::from("/etc/wolfram/config.toml")
     });
 
-    if config_path.exists() {
-        let contents = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("reading config file {}", config_path.display()))?;
-        let file: FileConfig = toml::from_str(&contents)
-            .with_context(|| format!("parsing config file {}", config_path.display()))?;
+    // --restore-tuning (ExecStopPost, uninstall.sh) must work even with a
+    // broken config file: it only needs the state directory, and failing
+    // here would leave the host's kernel values changed.
+    let file = if config_path.exists() {
+        let parsed = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("reading config file {}", config_path.display()))
+            .and_then(|c| {
+                toml::from_str::<FileConfig>(&c)
+                    .with_context(|| format!("parsing config file {}", config_path.display()))
+            });
+        match parsed {
+            Ok(f) => Some(f),
+            Err(e) if cli.restore_tuning => {
+                eprintln!("warning: {e:#} — using default state directory for restore");
+                None
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
+
+    if let Some(file) = file {
 
         if let Some(v) = file.min_process_anon_mib {
             config.min_process_anon_mib = v;
@@ -232,6 +293,15 @@ pub fn load() -> Result<(Config, String)> {
         }
         if let Some(v) = file.dry_run {
             config.dry_run = v;
+        }
+        if let Some(v) = file.skip_gpu_processes {
+            config.skip_gpu_processes = v;
+        }
+        if let Some(v) = file.refault_backoff_threshold {
+            config.refault_backoff_threshold = v;
+        }
+        if let Some(v) = file.refault_backoff_cycles {
+            config.refault_backoff_cycles = v;
         }
 
         log::info!("Loaded config from {}", config_path.display());
@@ -279,6 +349,21 @@ pub fn load() -> Result<(Config, String)> {
     }
     if cli.dry_run {
         config.dry_run = true;
+    }
+    config.restore_tuning_only = cli.restore_tuning;
+
+    if config.restore_tuning_only {
+        return Ok((config, log_level));
+    }
+
+    for (name, v) in [
+        ("cold_threshold", config.cold_threshold),
+        ("pageout_threshold", config.pageout_threshold),
+        ("refault_backoff_threshold", config.refault_backoff_threshold),
+    ] {
+        if !(0.0..=1.0).contains(&v) {
+            anyhow::bail!("{name} must be between 0.0 and 1.0 (got {v})");
+        }
     }
 
     // Always exclude ourselves.

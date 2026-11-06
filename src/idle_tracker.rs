@@ -19,9 +19,48 @@ use crate::scanner::MemoryRegion;
 const PAGE_SIZE: u64 = 4096;
 const PAGEMAP_ENTRY_SIZE: u64 = 8;
 
-// Pagemap entry bits (Documentation/admin-guide/mm/pagemap.rst).
+// Pagemap entry bits (proc_pid_pagemap(5)): 63 present in RAM, 62 in swap,
+// 61 file-mapped or shared-anonymous page, 54-0 PFN when present.
 const PM_PRESENT: u64 = 1 << 63;
+const PM_SWAP: u64 = 1 << 62;
+const PM_FILE: u64 = 1 << 61;
 const PM_PFN_MASK: u64 = (1 << 55) - 1;
+
+/// A run of consecutive virtual pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageRun {
+    pub start_vpage: u64,
+    pub pages: u64,
+}
+
+impl PageRun {
+    pub fn addr(&self) -> u64 {
+        self.start_vpage * PAGE_SIZE
+    }
+    pub fn len_bytes(&self) -> u64 {
+        self.pages * PAGE_SIZE
+    }
+}
+
+/// Coalesce sorted, de-duplicated virtual page numbers into runs.
+fn coalesce(vpages: impl IntoIterator<Item = u64>) -> Vec<PageRun> {
+    let mut runs: Vec<PageRun> = Vec::new();
+    for v in vpages {
+        match runs.last_mut() {
+            Some(r) if r.start_vpage + r.pages == v => r.pages += 1,
+            _ => runs.push(PageRun { start_vpage: v, pages: 1 }),
+        }
+    }
+    runs
+}
+
+pub fn total_pages(runs: &[PageRun]) -> u64 {
+    runs.iter().map(|r| r.pages).sum()
+}
+
+pub fn pages_to_kib(pages: u64) -> u64 {
+    pages * (PAGE_SIZE / 1024)
+}
 
 /// Physical page frame numbers collected for a region.
 /// Store this between mark and check calls.
@@ -39,6 +78,10 @@ pub struct IdleResult {
     pub resident_pages: u64,
     /// Number of resident pages that were idle (not accessed since last mark).
     pub idle_pages: u64,
+    /// The idle pages as virtual-page runs: the only pages worth advising.
+    /// Advising the whole region would also push out its hot pages, which
+    /// fault straight back in.
+    pub idle_runs: Vec<PageRun>,
 }
 
 impl IdleResult {
@@ -50,11 +93,6 @@ impl IdleResult {
         self.idle_pages as f64 / self.resident_pages as f64
     }
 
-    /// KiB of memory that is idle and could be compressed.
-    #[allow(dead_code)] // public API for future use
-    pub fn idle_kib(&self) -> u64 {
-        self.idle_pages * (PAGE_SIZE / 1024)
-    }
 }
 
 /// Collect PFNs and mark pages as idle for a region.
@@ -79,43 +117,81 @@ pub fn check_idle(marked: &MarkedRegion) -> Result<IdleResult> {
             region: marked.region.clone(),
             resident_pages: 0,
             idle_pages: 0,
+            idle_runs: Vec::new(),
         });
     }
 
     let mut idle_file = File::open("/sys/kernel/mm/page_idle/bitmap")
         .context("opening page_idle bitmap for reading")?;
 
-    // Batch reads by bitmap offset for efficiency.
-    let mut by_offset: HashMap<u64, Vec<u64>> = HashMap::new();
-    for &(_vpage, pfn) in &marked.pfns {
-        let offset = (pfn / 64) * 8;
-        by_offset.entry(offset).or_default().push(pfn);
-    }
-
-    // Sort offsets so we seek forward through the file.
-    let mut offsets: Vec<u64> = by_offset.keys().copied().collect();
-    offsets.sort();
-
-    let mut idle_count: u64 = 0;
+    // Read each 64-bit bitmap word once, in ascending offset order.
+    let mut offsets: Vec<u64> = marked.pfns.iter().map(|&(_, pfn)| (pfn / 64) * 8).collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    let mut words: HashMap<u64, u64> = HashMap::with_capacity(offsets.len());
     for offset in offsets {
         idle_file.seek(SeekFrom::Start(offset))?;
         let mut buf = [0u8; 8];
         idle_file.read_exact(&mut buf)?;
-        let bits = u64::from_le_bytes(buf);
-
-        for &pfn in &by_offset[&offset] {
-            let bit = pfn % 64;
-            if bits & (1u64 << bit) != 0 {
-                idle_count += 1;
-            }
-        }
+        words.insert(offset, u64::from_le_bytes(buf));
     }
+
+    // pfns are in ascending virtual-page order (collect_pfns walks forward).
+    let idle_vpages = marked.pfns.iter().filter_map(|&(vpage, pfn)| {
+        let bits = words[&((pfn / 64) * 8)];
+        (bits & (1u64 << (pfn % 64)) != 0).then_some(vpage)
+    });
+    let idle_runs = coalesce(idle_vpages);
 
     Ok(IdleResult {
         region: marked.region.clone(),
         resident_pages: marked.pfns.len() as u64,
-        idle_pages: idle_count,
+        idle_pages: total_pages(&idle_runs),
+        idle_runs,
     })
+}
+
+/// How many pages of `runs` were resident when `marked` was collected.
+/// Called with the runs paged out last cycle, this is the refault count.
+pub fn present_pages_in(marked: &MarkedRegion, runs: &[PageRun]) -> u64 {
+    let mut count = 0;
+    let mut ri = 0;
+    for &(vpage, _) in &marked.pfns {
+        while ri < runs.len() && runs[ri].start_vpage + runs[ri].pages <= vpage {
+            ri += 1;
+        }
+        if ri == runs.len() {
+            break;
+        }
+        if vpage >= runs[ri].start_vpage {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Of the pages in `runs`, those now out in swap (bit 62 set, not present).
+/// Called right after MADV_PAGEOUT, this is what really left RAM: the
+/// kernel skips pages it cannot reclaim (shared, pinned, under writeback).
+pub fn swapped_runs(pid: u32, runs: &[PageRun]) -> Result<Vec<PageRun>> {
+    let pagemap_path = format!("/proc/{pid}/pagemap");
+    let mut pagemap = File::open(&pagemap_path)
+        .with_context(|| format!("opening {pagemap_path}"))?;
+    let mut swapped = Vec::new();
+    for run in runs {
+        pagemap.seek(SeekFrom::Start(run.start_vpage * PAGEMAP_ENTRY_SIZE))?;
+        let mut buf = vec![0u8; (run.pages * PAGEMAP_ENTRY_SIZE) as usize];
+        if pagemap.read_exact(&mut buf).is_err() {
+            break; // process vanished or unmapped the range
+        }
+        for (i, chunk) in buf.chunks_exact(8).enumerate() {
+            let entry = u64::from_le_bytes(chunk.try_into().unwrap());
+            if entry & PM_SWAP != 0 && entry & PM_PRESENT == 0 {
+                swapped.push(run.start_vpage + i as u64);
+            }
+        }
+    }
+    Ok(coalesce(swapped))
 }
 
 // Max pagemap read per chunk: 8MB buffer = 1M pages = 4GB of virtual address space.
@@ -171,7 +247,9 @@ fn collect_pfns(pid: u32, region: &MemoryRegion) -> Result<Vec<(u64, u64)>> {
                     .unwrap(),
             );
 
-            if entry & PM_PRESENT != 0 {
+            // Skip file / shared-anonymous pages: only exclusive anonymous
+            // memory is a page-out candidate.
+            if entry & PM_PRESENT != 0 && entry & PM_FILE == 0 {
                 let pfn = entry & PM_PFN_MASK;
                 if pfn > 0 {
                     pfns.push((page_offset + i, pfn));
@@ -214,4 +292,40 @@ fn write_idle_bits(pfns: &[(u64, u64)]) -> Result<()> {
 /// Check if the kernel has idle page tracking support.
 pub fn is_supported() -> bool {
     std::path::Path::new("/sys/kernel/mm/page_idle/bitmap").exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalesce_runs() {
+        let r = coalesce([1, 2, 3, 7, 8, 10]);
+        assert_eq!(
+            r,
+            vec![
+                PageRun { start_vpage: 1, pages: 3 },
+                PageRun { start_vpage: 7, pages: 2 },
+                PageRun { start_vpage: 10, pages: 1 },
+            ]
+        );
+        assert_eq!(total_pages(&r), 6);
+        assert!(coalesce(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn present_pages_counts_only_inside_runs() {
+        let region = MemoryRegion { pid: 1, start: 0, end: 100 * PAGE_SIZE, rss_kib: 0 };
+        let marked = MarkedRegion {
+            region,
+            pfns: [0u64, 1, 2, 5, 6, 9, 20].iter().map(|&v| (v, 1000 + v)).collect(),
+        };
+        let runs = [
+            PageRun { start_vpage: 1, pages: 2 }, // 1,2 -> 2 present
+            PageRun { start_vpage: 4, pages: 3 }, // 4,5,6 -> 2 present
+            PageRun { start_vpage: 15, pages: 3 }, // none
+        ];
+        assert_eq!(present_pages_in(&marked, &runs), 4);
+        assert_eq!(present_pages_in(&marked, &[]), 0);
+    }
 }

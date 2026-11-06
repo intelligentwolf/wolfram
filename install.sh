@@ -125,7 +125,11 @@ generate_config() {
     ENV_TYPE="server"
     # Base exclusions — always present. Note: kernel truncates /proc/[pid]/status Name: to
     # 15 characters, so exclusion strings longer than 15 chars will never match.
-    ENV_EXCLUDES='"systemd", "wolfram", "sshd", "dockerd", "containerd", "containerd-shim", "kubelet", "kube-proxy", "kube-apiserver", "kube-controller", "kube-scheduler", "etcd"'
+    # Databases and LLM servers are excluded too: their idle pages are caches
+    # and model weights that come straight back on the next query ("llama"
+    # also matches ollama and llama-server). Processes holding a GPU device
+    # open are skipped automatically (skip_gpu_processes, default on).
+    ENV_EXCLUDES='"systemd", "wolfram", "sshd", "dockerd", "containerd", "containerd-shim", "kubelet", "kube-proxy", "kube-apiserver", "kube-controller", "kube-scheduler", "etcd", "postgres", "mysqld", "mariadbd", "llama"'
     MIN_ANON=50
     MIN_REGION=4096
     CYCLE_SECS=120
@@ -135,13 +139,14 @@ generate_config() {
     PAGEOUT_CYCLES=3
 
     # Desktop detection first — a dev machine with Docker is still a desktop.
-    # Check for running display server processes (env vars are lost under sudo).
+    # Check for a running display server or display manager (env vars are lost
+    # under sudo). Installed session files (/usr/share/xsessions) are NOT
+    # evidence: headless servers often carry them as package dependencies, and
+    # that used to put container hosts on the desktop profile.
     IS_DESKTOP=false
-    if pgrep 'Xorg|Xwayland|gnome-shell|kwin_wayland|plasmashell|sway|hyprland|mutter' >/dev/null 2>&1; then
+    if pgrep 'Xorg|Xwayland|gnome-shell|kwin_wayland|plasmashell|sway|hyprland|mutter|^gdm|^sddm|^lightdm' >/dev/null 2>&1; then
         IS_DESKTOP=true
     elif [ -n "$DISPLAY" ] || [ -n "$WAYLAND_DISPLAY" ]; then
-        IS_DESKTOP=true
-    elif [ -d /usr/share/xsessions ] || [ -d /usr/share/wayland-sessions ]; then
         IS_DESKTOP=true
     fi
 
@@ -230,6 +235,13 @@ enable_port_proxy = false
 excluded_names = [$ENV_EXCLUDES]
 excluded_pids = [1]
 dry_run = false
+
+# Never touch processes holding /dev/dri, /dev/kfd, /dev/nvidia* or /dev/accel.
+skip_gpu_processes = true
+# A region whose paged-out pages are >= 25% back in RAM one cycle later is
+# hot: leave it alone for 10 cycles.
+refault_backoff_threshold = 0.25
+refault_backoff_cycles = 10
 CONFIGEOF
 }
 
@@ -380,4 +392,9 @@ echo "  Check savings:  cat /var/lib/wolfram/stats.json"
 echo "  Check status:   systemctl status wolfram"
 echo "  Stop:           systemctl stop wolfram"
 echo "  Reconfigure:    nano $CONFIG_DIR/config.toml && systemctl restart wolfram"
+echo ""
+echo "  While running, Wolfram changes vm.swappiness, vfs_cache_pressure,"
+echo "  compaction_proactiveness, watermark_boost_factor, KSM and zswap."
+echo "  The originals are saved in $DATA_DIR/original-tuning.json and put back"
+echo "  when the service stops."
 echo ""

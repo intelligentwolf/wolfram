@@ -5,6 +5,7 @@ mod hibernator;
 mod idle_tracker;
 mod scanner;
 mod stats;
+mod tuning;
 mod zram;
 
 use log::{error, info};
@@ -35,20 +36,49 @@ fn main() {
         std::process::exit(1);
     }
 
+    let mut tuning = tuning::Tuning::load(&cfg.state_dir());
+
+    if cfg.restore_tuning_only {
+        // Leftover zram devices first (daemon killed before its own
+        // cleanup), so zswap is not re-enabled under a live zram swap.
+        tuning.remove_leftover_zram();
+        info!("Restoring kernel values changed by Wolfram...");
+        tuning.restore();
+        return;
+    }
+
+    if !cfg.dry_run {
+        // A previous instance of this boot died without cleanup.
+        tuning.remove_leftover_zram();
+    }
+
     if cfg.dry_run {
         info!("DRY RUN mode — will scan and report but not modify anything");
     }
 
     print_system_info();
     set_low_priority();
-    tune_kernel();
+    if cfg.dry_run {
+        info!("  [dry-run] not changing kernel tuning or KSM");
+    } else {
+        tune_kernel(&mut tuning);
+    }
 
     // Set up signal handler for graceful shutdown.
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(&shutdown);
 
-    // Run the daemon.
-    if let Err(e) = daemon::run(cfg, shutdown) {
+    // Run the daemon. It removes its zram devices before returning, so
+    // zswap can safely be re-enabled by the restore below.
+    let dry_run = cfg.dry_run;
+    let result = daemon::run(cfg, shutdown, &mut tuning);
+    // A dry run changed nothing, and the state file may belong to a live
+    // daemon instance — never restore from it here.
+    if !dry_run {
+        info!("Restoring kernel values changed by Wolfram...");
+        tuning.restore();
+    }
+    if let Err(e) = result {
         error!("Daemon error: {e:#}");
         std::process::exit(1);
     }
@@ -160,10 +190,10 @@ fn set_low_priority() {
 }
 
 /// Tune kernel parameters for optimal memory compression.
-/// Each sysctl is applied independently — if the file doesn't exist
-/// on a given kernel/distro, it's silently skipped. We never fail
-/// startup over a missing sysctl.
-fn tune_kernel() {
+/// Each knob is applied independently — if it doesn't exist on a given
+/// kernel/distro, it's skipped. Every original value is recorded by `tuning`
+/// first and restored when Wolfram stops.
+fn tune_kernel(tuning: &mut tuning::Tuning) {
     let tunings: &[(&str, &str, &str)] = &[
         // Reclaim stale filesystem cache faster. Default 100.
         // Higher = kernel drops cached files sooner, freeing pages for zram.
@@ -191,30 +221,16 @@ fn tune_kernel() {
     ];
 
     let mut applied = Vec::new();
-
     for &(path, value, description) in tunings {
-        let sysctl = std::path::Path::new(path);
-        if !sysctl.exists() {
-            continue;
-        }
-
-        // Don't overwrite if already set to our value.
-        if let Ok(current) = std::fs::read_to_string(sysctl) {
-            if current.trim() == value {
-                continue;
-            }
-        }
-
-        match std::fs::write(sysctl, value) {
-            Ok(()) => applied.push(description),
-            Err(e) => {
-                log::debug!("Could not set {path}: {e}");
-            }
+        match tuning.set(path, value) {
+            Ok(true) => applied.push(description),
+            Ok(false) => {}
+            Err(e) => log::debug!("Could not set {path}: {e:#}"),
         }
     }
 
     if !applied.is_empty() {
-        info!("  Kernel tuning:");
+        info!("  Kernel tuning (restored on stop):");
         for desc in &applied {
             info!("    {desc}");
         }
@@ -223,19 +239,24 @@ fn tune_kernel() {
     // Enable KSM (Kernel Same-page Merging) if available but not running.
     // KSM deduplicates identical pages across all processes — huge savings
     // when running many instances of the same runtime (.NET, Java, Node).
-    let ksm_run = std::path::Path::new("/sys/kernel/mm/ksm/run");
-    if ksm_run.exists() {
+    // On stop, run goes back to 0, which per the kernel's KSM docs stops
+    // ksmd "but keep[s] merged pages" — no mass unmerge spike.
+    let ksm_run = "/sys/kernel/mm/ksm/run";
+    if std::path::Path::new(ksm_run).exists() {
         let current = std::fs::read_to_string(ksm_run).unwrap_or_default();
         if current.trim() == "0" {
-            match std::fs::write(ksm_run, "1") {
-                Ok(()) => {
+            match tuning.set(ksm_run, "1") {
+                Ok(false) => {}
+                Ok(true) => {
                     // Tune KSM scan speed — default is conservative (100 pages per 20ms).
                     // Increase to 1000 pages to find duplicates faster.
-                    std::fs::write("/sys/kernel/mm/ksm/pages_to_scan", "1000").ok();
-                    info!("  KSM: enabled (deduplicates identical pages across processes)");
+                    if let Err(e) = tuning.set("/sys/kernel/mm/ksm/pages_to_scan", "1000") {
+                        log::debug!("Could not set KSM pages_to_scan: {e:#}");
+                    }
+                    info!("  KSM: enabled (deduplicates identical pages across processes; restored on stop)");
                 }
                 Err(e) => {
-                    log::debug!("Could not enable KSM: {e}");
+                    log::debug!("Could not enable KSM: {e:#}");
                 }
             }
         } else {

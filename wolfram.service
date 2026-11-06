@@ -8,6 +8,10 @@ StartLimitIntervalSec=120
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/wolfram
+# Put back every kernel value Wolfram changed (swappiness, vfs_cache_pressure,
+# compaction, watermark boost, KSM, zswap) even if the daemon crashed or was
+# killed before its own shutdown path ran. No-op if nothing is recorded.
+ExecStopPost=/usr/local/bin/wolfram --restore-tuning
 Nice=19
 IOSchedulingClass=idle
 Restart=on-failure

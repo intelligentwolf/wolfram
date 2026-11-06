@@ -8,11 +8,11 @@
 //!
 //! Requires CAP_SYS_NICE or same-uid as the target process.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::fs;
 use std::path::Path;
 
-use crate::scanner::MemoryRegion;
+use crate::idle_tracker::PageRun;
 
 // Syscall numbers vary by architecture.
 // Sources: arch/x86/entry/syscalls/syscall_64.tbl,
@@ -47,66 +47,144 @@ pub enum Action {
     PageOut,
 }
 
-/// Result of a compression action.
-#[derive(Debug)]
-pub struct CompressResult {
-    pub success: bool,
+/// What one `advise_runs` call achieved.
+#[derive(Debug, Default)]
+pub struct AdviseOutcome {
+    /// Bytes the kernel accepted the advice for.
+    pub bytes: u64,
+    /// The target exited (ESRCH) — stop working on it this cycle.
+    pub gone: bool,
 }
 
-/// Apply a memory advise action to a specific region of another process.
-pub fn advise_region(pid: u32, region: &MemoryRegion, action: Action) -> Result<CompressResult> {
+/// process_madvise() takes at most IOV_MAX iovecs per call
+/// (process_madvise(2)); Linux defines it as UIO_MAXIOV = 1024
+/// (include/uapi/linux/uio.h:46), used if sysconf cannot answer.
+fn iov_max() -> usize {
+    let v = unsafe { libc::sysconf(libc::_SC_IOV_MAX) };
+    if v > 0 { v as usize } else { 1024 }
+}
+
+/// Apply `action` to the given page runs of another process, batching the
+/// runs into as few process_madvise() calls as IOV_MAX allows.
+pub fn advise_runs(pid: u32, runs: &[PageRun], action: Action) -> Result<AdviseOutcome> {
+    let mut outcome = AdviseOutcome::default();
+    if runs.is_empty() {
+        return Ok(outcome);
+    }
     let advice = match action {
         Action::Cold => MADV_COLD,
         Action::PageOut => MADV_PAGEOUT,
     };
 
-    let region_size = region.end - region.start;
-
-    let pidfd = open_pidfd(pid)
-        .with_context(|| format!("opening pidfd for PID {pid}"))?;
-
-    let iov = libc::iovec {
-        iov_base: region.start as *mut libc::c_void,
-        iov_len: region_size as usize,
+    let pidfd = match open_pidfd(pid) {
+        Ok(fd) => fd,
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
+            outcome.gone = true;
+            return Ok(outcome);
+        }
+        Err(e) => return Err(anyhow::anyhow!("pidfd_open({pid}) failed: {e}")),
     };
 
-    let ret = unsafe {
-        libc::syscall(
-            SYS_PROCESS_MADVISE,
-            pidfd,
-            &iov as *const libc::iovec,
-            1usize, // vlen: size_t
-            advice as libc::c_int,
-            0 as libc::c_uint,
-        )
-    };
+    let iovs: Vec<libc::iovec> = runs
+        .iter()
+        .map(|r| libc::iovec {
+            iov_base: r.addr() as *mut libc::c_void,
+            iov_len: r.len_bytes() as usize,
+        })
+        .collect();
+    let max = iov_max();
+
+    // process_madvise(2) handles the iovecs in order and stops at the first
+    // one that fails, returning the bytes done before it (or -1 if the very
+    // first one failed). So after a short return, skip the iovec it stopped
+    // on and carry on with the rest — one unmapped range must not cost us
+    // every range after it.
+    let mut i = 0;
+    while i < iovs.len() {
+        let batch = &iovs[i..(i + max).min(iovs.len())];
+        let ret = unsafe {
+            libc::syscall(
+                SYS_PROCESS_MADVISE,
+                pidfd,
+                batch.as_ptr(),
+                batch.len(), // vlen: size_t
+                advice as libc::c_int,
+                0 as libc::c_uint,
+            )
+        };
+
+        let done = if ret >= 0 {
+            let ret = ret as u64;
+            outcome.bytes += ret;
+            // Count whole iovecs covered by `ret`.
+            let mut sum = 0u64;
+            let mut n = 0;
+            while n < batch.len() && sum + batch[n].iov_len as u64 <= ret {
+                sum += batch[n].iov_len as u64;
+                n += 1;
+            }
+            if n == batch.len() {
+                i += n;
+                continue;
+            }
+            n
+        } else {
+            0
+        };
+
+        // batch[done] failed. Find out why, if the call itself errored;
+        // a short positive return carries no errno, so probe the one range.
+        let err = if ret < 0 {
+            std::io::Error::last_os_error()
+        } else {
+            let one = unsafe {
+                libc::syscall(SYS_PROCESS_MADVISE, pidfd, &batch[done] as *const libc::iovec, 1usize, advice as libc::c_int, 0 as libc::c_uint)
+            };
+            if one >= 0 {
+                // Succeeded on retry (mapping changed back) — count it.
+                outcome.bytes += one as u64;
+                i += done + 1;
+                continue;
+            }
+            std::io::Error::last_os_error()
+        };
+        match err.raw_os_error() {
+            // Process exited.
+            Some(libc::ESRCH) => {
+                outcome.gone = true;
+                break;
+            }
+            // madvise(2): "Addresses in the specified range are not
+            // currently mapped" — the process unmapped or remapped this
+            // memory after we read smaps. A race, not memory pressure.
+            Some(libc::ENOMEM) => {
+                log::debug!(
+                    "process_madvise({pid}, {action:?}): range 0x{:x} no longer mapped (process changed its mappings since the scan)",
+                    batch[done].iov_base as u64,
+                );
+                i += done + 1;
+            }
+            // Anything else (EPERM, EINVAL, ...) would fail the same way for
+            // every remaining range of this process.
+            _ => {
+                log::warn!("process_madvise({pid}, {action:?}) failed: {err}");
+                break;
+            }
+        }
+    }
 
     unsafe {
         libc::close(pidfd);
     }
-
-    let success = ret >= 0;
-    if !success {
-        let err = std::io::Error::last_os_error();
-        log::warn!(
-            "process_madvise({pid}, {action:?}, 0x{:x}..0x{:x}) failed: {err}",
-            region.start,
-            region.end,
-        );
-    }
-
-    Ok(CompressResult { success })
+    Ok(outcome)
 }
 
 /// Open a pidfd for the given PID (pidfd_open syscall, Linux 5.3+).
-fn open_pidfd(pid: u32) -> Result<i32> {
+fn open_pidfd(pid: u32) -> std::io::Result<i32> {
     let fd = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid as libc::c_int, 0 as libc::c_uint) };
 
     if fd < 0 {
-        anyhow::bail!(
-            "pidfd_open({pid}) failed: {}",
-            std::io::Error::last_os_error()
-        );
+        return Err(std::io::Error::last_os_error());
     }
 
     Ok(fd as i32)

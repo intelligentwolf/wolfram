@@ -10,7 +10,7 @@
 
 use anyhow::Result;
 use log::{debug, error, info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,37 +18,58 @@ use std::time::{Duration, Instant};
 use crate::compressor::{self, Action};
 use crate::config::Config;
 use crate::hibernator::Hibernator;
-use crate::idle_tracker::{self, MarkedRegion};
+use crate::idle_tracker::{self, MarkedRegion, PageRun};
 use crate::scanner::{self, ProcessInfo};
 use crate::stats::StatsTracker;
+use crate::tuning::Tuning;
 use crate::zram::ZramManager;
 
-/// Tracks how many consecutive cycles a region has been idle.
+/// Per-region state, keyed by (pid, region start).
+#[derive(Default)]
+struct RegionState {
+    /// Consecutive cycles the region met the cold threshold.
+    idle_cycles: u32,
+    /// Pages last cycle's MADV_PAGEOUT actually moved to swap. Checked at the
+    /// next mark: any of them resident again were refaulted.
+    paged_out: Vec<PageRun>,
+    paged_out_pages: u64,
+    /// The region refaulted heavily; leave it alone until this cycle.
+    backoff_until: u64,
+}
+
 struct RegionHistory {
-    idle_cycles: HashMap<(u32, u64), u32>,
+    regions: HashMap<(u32, u64), RegionState>,
 }
 
 impl RegionHistory {
     fn new() -> Self {
-        Self {
-            idle_cycles: HashMap::new(),
-        }
+        Self { regions: HashMap::new() }
     }
 
-    fn record_idle(&mut self, pid: u32, start: u64) -> u32 {
-        let count = self.idle_cycles.entry((pid, start)).or_insert(0);
-        *count += 1;
-        *count
+    fn entry(&mut self, pid: u32, start: u64) -> &mut RegionState {
+        self.regions.entry((pid, start)).or_default()
     }
 
-    fn record_active(&mut self, pid: u32, start: u64) {
-        self.idle_cycles.remove(&(pid, start));
+    /// Forget regions not seen this cycle (unmapped, or their process
+    /// exited) — except a region still in back-off whose process is alive: a
+    /// single missed scan (transient read failure, process briefly under the
+    /// anon threshold) must not erase the back-off and get a hot region
+    /// paged out again at once.
+    fn retain_seen(&mut self, seen: &HashSet<(u32, u64)>, live_pids: &HashSet<u32>, cycle: u64) {
+        self.regions.retain(|k, st| {
+            seen.contains(k) || (st.backoff_until > cycle && live_pids.contains(&k.0))
+        });
     }
+}
 
-    fn prune(&mut self, active_pids: &[u32]) {
-        self.idle_cycles
-            .retain(|&(pid, _), _| active_pids.contains(&pid));
-    }
+/// Lifetime counters. "Paged out" counts only pages verified to be in swap
+/// after MADV_PAGEOUT, not every byte we asked about; "refaulted" counts the
+/// paged-out pages found back in RAM one cycle later.
+#[derive(Default)]
+pub struct Lifetime {
+    pub paged_out_kib: u64,
+    pub refaulted_kib: u64,
+    pub cold_advised_kib: u64,
 }
 
 /// Tracks how many consecutive cycles a process has had all regions idle.
@@ -80,7 +101,7 @@ impl ProcessIdleTracker {
 }
 
 /// Run the daemon. Loops until `shutdown` flag is set.
-pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<()> {
+pub fn run(config: Config, shutdown: Arc<AtomicBool>, tuning: &mut Tuning) -> Result<()> {
     info!("Wolfram memory compression daemon starting");
     info!(
         "  min process anon: {} MiB, min region: {} KiB",
@@ -96,6 +117,12 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<()> {
         config.pageout_threshold * 100.0,
         config.pageout_after_cycles
     );
+    info!(
+        "  refault back-off: {:.0}% of paged-out pages back within a cycle -> leave region alone {} cycles; skip GPU processes: {}",
+        config.refault_backoff_threshold * 100.0,
+        config.refault_backoff_cycles,
+        config.skip_gpu_processes
+    );
 
     let use_idle_tracking = idle_tracker::is_supported();
     if !use_idle_tracking {
@@ -110,8 +137,10 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<()> {
 
     // Set up zram compressed swap (preferred) or fall back to zswap.
     let mut zram_mgr = ZramManager::new();
-    if crate::zram::is_supported() {
-        match zram_mgr.init() {
+    if config.dry_run {
+        info!("[dry-run] not creating zram devices or changing swappiness");
+    } else if crate::zram::is_supported() {
+        match zram_mgr.init(tuning) {
             Ok(()) => info!("Using zram for in-RAM compression (no disk)"),
             Err(e) => {
                 warn!("Could not init zram: {e}");
@@ -137,10 +166,11 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<()> {
 
     let mut region_history = RegionHistory::new();
     let mut process_idle = ProcessIdleTracker::new();
-    let mut total_compressed_kib: u64 = 0;
+    let mut lifetime = Lifetime::default();
+    let mut gpu_logged: HashSet<u32> = HashSet::new();
     let mut cycle_count: u64 = 0;
 
-    let stats_tracker = StatsTracker::new(config.checkpoint_dir.parent().unwrap_or(std::path::Path::new("/var/lib/wolfram")));
+    let stats_tracker = StatsTracker::new(&config.state_dir());
 
     let min_anon_kib = config.min_process_anon_mib * 1024;
     let idle_sample = Duration::from_secs(config.idle_sample_secs);
@@ -161,11 +191,13 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<()> {
             &mut region_history,
             &mut process_idle,
             &mut hibernator,
-            &mut total_compressed_kib,
+            &mut lifetime,
+            &mut gpu_logged,
             cycle_count,
             &shutdown,
             &stats_tracker,
             &mut zram_mgr,
+            tuning,
         ) {
             Ok(()) => {}
             Err(e) => {
@@ -184,14 +216,18 @@ pub fn run(config: Config, shutdown: Arc<AtomicBool>) -> Result<()> {
     // Graceful shutdown.
     if zram_mgr.has_devices() {
         info!("Shutting down — cleaning up zram devices...");
-        zram_mgr.cleanup();
+        zram_mgr.cleanup(tuning);
     }
     if hibernator.has_hibernated() {
         info!("Shutting down — restoring hibernated processes...");
         hibernator.restore_all();
     }
 
-    info!("Wolfram stopped. Total lifetime compression: ~{} MiB", total_compressed_kib / 1024);
+    info!(
+        "Wolfram stopped. Lifetime: ~{} MiB paged out, ~{} MiB of it refaulted",
+        lifetime.paged_out_kib / 1024,
+        lifetime.refaulted_kib / 1024,
+    );
     Ok(())
 }
 
@@ -217,11 +253,13 @@ fn run_cycle(
     region_history: &mut RegionHistory,
     process_idle: &mut ProcessIdleTracker,
     hibernator: &mut Hibernator,
-    total_compressed_kib: &mut u64,
+    lifetime: &mut Lifetime,
+    gpu_logged: &mut HashSet<u32>,
     cycle_count: u64,
     shutdown: &AtomicBool,
     stats_tracker: &StatsTracker,
     zram_mgr: &mut ZramManager,
+    tuning: &mut Tuning,
 ) -> Result<()> {
     // Step 1: Scan for memory-heavy processes.
     info!("Cycle {cycle_count}: scanning processes...");
@@ -229,8 +267,9 @@ fn run_cycle(
 
     if processes.is_empty() {
         info!("Cycle {cycle_count}: no processes above {} MiB threshold", config.min_process_anon_mib);
+        region_history.retain_seen(&HashSet::new(), &HashSet::new(), cycle_count);
         let hstats = hibernator.stats();
-        stats_tracker.write(cycle_count, *total_compressed_kib, &hstats, zram_mgr);
+        stats_tracker.write(cycle_count, lifetime, &hstats, zram_mgr);
         return Ok(());
     }
 
@@ -241,19 +280,40 @@ fn run_cycle(
     );
 
     let active_pids: Vec<u32> = processes.iter().map(|p| p.pid).collect();
-    region_history.prune(&active_pids);
     process_idle.prune(&active_pids);
+    gpu_logged.retain(|pid| active_pids.contains(pid));
 
     // Filter to eligible processes.
     let eligible: Vec<&ProcessInfo> = processes
         .iter()
         .filter(|p| !is_excluded(p, config))
+        .filter(|p| {
+            if config.skip_gpu_processes && scanner::holds_gpu_device(p.pid) {
+                if gpu_logged.insert(p.pid) {
+                    info!(
+                        "  Skipping {} (PID {}): holds a GPU/accelerator device open",
+                        p.name, p.pid
+                    );
+                }
+                false
+            } else {
+                true
+            }
+        })
         .collect();
 
-    // Step 2: Mark all regions idle across all processes.
-    let mut all_marked: Vec<(u32, MarkedRegion)> = Vec::new();
+    let mut seen: HashSet<(u32, u64)> = HashSet::new();
+    let mut cycle = Lifetime::default();
+    let mut cycle_actions: u64 = 0;
+    let mut gone: HashSet<u32> = HashSet::new();
+
+    // Track per-process: were ALL regions idle?
+    let mut process_all_idle: HashMap<u32, bool> = HashMap::new();
 
     if use_idle_tracking {
+        // Step 2: Mark all regions idle across all processes, and check
+        // what last cycle's page-outs did.
+        let mut all_marked: Vec<(u32, MarkedRegion)> = Vec::new();
         info!("  Scanning {} eligible processes...", eligible.len());
         for proc_info in &eligible {
             if shutdown.load(Ordering::Relaxed) {
@@ -267,12 +327,36 @@ fn run_cycle(
                 };
 
             for region in &regions {
-                match idle_tracker::mark_idle(proc_info.pid, region) {
-                    Ok(marked) => all_marked.push((proc_info.pid, marked)),
+                let marked = match idle_tracker::mark_idle(proc_info.pid, region) {
+                    Ok(m) => m,
                     Err(e) => {
                         debug!("  mark_idle failed for PID {} region 0x{:x}: {e}", proc_info.pid, region.start);
+                        continue;
                     }
+                };
+                seen.insert((proc_info.pid, region.start));
+                let st = region_history.entry(proc_info.pid, region.start);
+                if !st.paged_out.is_empty() {
+                    let refaulted = idle_tracker::present_pages_in(&marked, &st.paged_out);
+                    cycle.refaulted_kib += idle_tracker::pages_to_kib(refaulted);
+                    let frac = refaulted as f64 / st.paged_out_pages.max(1) as f64;
+                    if refaulted > 0 && frac >= config.refault_backoff_threshold {
+                        st.backoff_until = cycle_count + u64::from(config.refault_backoff_cycles);
+                        st.idle_cycles = 0;
+                        info!(
+                            "  {} (PID {}) region 0x{:x}: {:.0}% of the {} KiB paged out last cycle came straight back — leaving it alone for {} cycles",
+                            proc_info.name,
+                            proc_info.pid,
+                            region.start,
+                            frac * 100.0,
+                            idle_tracker::pages_to_kib(st.paged_out_pages),
+                            config.refault_backoff_cycles,
+                        );
+                    }
+                    st.paged_out.clear();
+                    st.paged_out_pages = 0;
                 }
+                all_marked.push((proc_info.pid, marked));
             }
         }
 
@@ -288,17 +372,12 @@ fn run_cycle(
         if shutdown.load(Ordering::Relaxed) {
             return Ok(());
         }
-    }
 
-    // Step 4-5: Check idle and apply actions.
-    let mut cycle_compressed_kib: u64 = 0;
-    let mut cycle_actions: u64 = 0;
-
-    // Track per-process: were ALL regions idle?
-    let mut process_all_idle: HashMap<u32, bool> = HashMap::new();
-
-    if use_idle_tracking {
+        // Step 4-5: Check idle and apply actions to the idle pages only.
         for (pid, marked) in &all_marked {
+            if gone.contains(pid) {
+                continue;
+            }
             let idle_result = match idle_tracker::check_idle(marked) {
                 Ok(r) => r,
                 Err(e) => {
@@ -316,32 +395,60 @@ fn run_cycle(
                 *all_idle = false;
             }
 
+            let st = region_history.entry(*pid, region.start);
+            if cycle_count < st.backoff_until {
+                continue;
+            }
+
             let action = if frac >= config.cold_threshold {
-                let consecutive = region_history.record_idle(*pid, region.start);
+                st.idle_cycles += 1;
                 if frac >= config.pageout_threshold
-                    && consecutive >= config.pageout_after_cycles
+                    && st.idle_cycles >= config.pageout_after_cycles
                 {
-                    Some(Action::PageOut)
+                    Action::PageOut
                 } else {
-                    Some(Action::Cold)
+                    Action::Cold
                 }
             } else {
-                region_history.record_active(*pid, region.start);
-                None
+                st.idle_cycles = 0;
+                continue;
             };
 
-            if let Some(action) = action {
-                debug!(
-                    "  PID {} region 0x{:x} ({} KiB, {:.0}% idle) -> {:?}",
-                    pid, region.start, region.rss_kib, frac * 100.0, action,
-                );
+            let idle_kib = idle_tracker::pages_to_kib(idle_result.idle_pages);
+            debug!(
+                "  PID {} region 0x{:x} ({} KiB resident, {:.0}% idle, {} idle runs) -> {:?}",
+                pid, region.start, region.rss_kib, frac * 100.0, idle_result.idle_runs.len(), action,
+            );
 
-                match compressor::advise_region(*pid, region, action) {
-                    Ok(result) if result.success => {
-                        cycle_compressed_kib += region.rss_kib;
-                        cycle_actions += 1;
-                    }
-                    _ => {}
+            if config.dry_run {
+                debug!("  [dry-run] would apply {action:?} to {idle_kib} KiB");
+                continue;
+            }
+
+            let outcome = match compressor::advise_runs(*pid, &idle_result.idle_runs, action) {
+                Ok(o) => o,
+                Err(e) => {
+                    warn!("  {e:#}");
+                    continue;
+                }
+            };
+            if outcome.gone {
+                gone.insert(*pid);
+                continue;
+            }
+            if outcome.bytes == 0 {
+                continue;
+            }
+            cycle_actions += 1;
+            match action {
+                Action::Cold => cycle.cold_advised_kib += outcome.bytes / 1024,
+                Action::PageOut => {
+                    let swapped = idle_tracker::swapped_runs(*pid, &idle_result.idle_runs)
+                        .unwrap_or_default();
+                    let pages = idle_tracker::total_pages(&swapped);
+                    cycle.paged_out_kib += idle_tracker::pages_to_kib(pages);
+                    st.paged_out = swapped;
+                    st.paged_out_pages = pages;
                 }
             }
         }
@@ -357,19 +464,35 @@ fn run_cycle(
                 };
 
             for region in &regions {
-                let consecutive = region_history.record_idle(proc_info.pid, region.start);
-                if consecutive >= config.pageout_after_cycles + 2 {
-                    match compressor::advise_region(proc_info.pid, region, Action::Cold) {
-                        Ok(result) if result.success => {
-                            cycle_compressed_kib += region.rss_kib;
-                            cycle_actions += 1;
-                        }
-                        _ => {}
+                seen.insert((proc_info.pid, region.start));
+                let st = region_history.entry(proc_info.pid, region.start);
+                st.idle_cycles += 1;
+                if st.idle_cycles < config.pageout_after_cycles + 2 {
+                    continue;
+                }
+                if config.dry_run {
+                    debug!("  [dry-run] would apply Cold to PID {} region 0x{:x}", proc_info.pid, region.start);
+                    continue;
+                }
+                let whole = [PageRun {
+                    start_vpage: region.start / 4096,
+                    pages: (region.end - region.start) / 4096,
+                }];
+                match compressor::advise_runs(proc_info.pid, &whole, Action::Cold) {
+                    Ok(o) if o.gone => break,
+                    Ok(o) if o.bytes > 0 => {
+                        cycle.cold_advised_kib += o.bytes / 1024;
+                        cycle_actions += 1;
                     }
+                    Ok(_) => {}
+                    Err(e) => warn!("  {e:#}"),
                 }
             }
         }
     }
+
+    let live_pids: HashSet<u32> = active_pids.iter().copied().collect();
+    region_history.retain_seen(&seen, &live_pids, cycle_count);
 
     // Check port proxies for incoming connections (wake-on-connect).
     if use_hibernation {
@@ -402,26 +525,31 @@ fn run_cycle(
         }
     }
 
-    *total_compressed_kib += cycle_compressed_kib;
+    lifetime.paged_out_kib += cycle.paged_out_kib;
+    lifetime.refaulted_kib += cycle.refaulted_kib;
+    lifetime.cold_advised_kib += cycle.cold_advised_kib;
 
-    if cycle_actions > 0 {
+    if cycle_actions > 0 || cycle.refaulted_kib > 0 {
         info!(
-            "Cycle {cycle_count}: {cycle_actions} regions compressed, \
-             ~{} MiB this cycle, ~{} MiB lifetime",
-            cycle_compressed_kib / 1024,
-            *total_compressed_kib / 1024,
+            "Cycle {cycle_count}: {cycle_actions} regions advised — paged out ~{} MiB, marked cold ~{} MiB, \
+             refaulted since last cycle ~{} MiB; lifetime paged out ~{} MiB (refaulted ~{} MiB)",
+            cycle.paged_out_kib / 1024,
+            cycle.cold_advised_kib / 1024,
+            cycle.refaulted_kib / 1024,
+            lifetime.paged_out_kib / 1024,
+            lifetime.refaulted_kib / 1024,
         );
     } else {
         debug!("Cycle {cycle_count}: no actions needed");
     }
 
     // Dynamic zram management — grow or shrink based on usage.
-    zram_mgr.maybe_grow();
-    zram_mgr.maybe_shrink();
+    zram_mgr.maybe_grow(tuning);
+    zram_mgr.maybe_shrink(tuning);
 
     // Write stats file and log summary.
     let hstats = hibernator.stats();
-    stats_tracker.write(cycle_count, *total_compressed_kib, &hstats, zram_mgr);
+    stats_tracker.write(cycle_count, lifetime, &hstats, zram_mgr);
 
     // Log compression stats from zram (preferred) or zswap (fallback).
     if let Some(zs) = zram_mgr.stats() {

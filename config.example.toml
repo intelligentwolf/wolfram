@@ -46,10 +46,22 @@ checkpoint_dir = "/var/lib/wolfram/checkpoints"
 enable_port_proxy = false
 
 # Process names to never touch (substring match).
-excluded_names = ["systemd", "wolfram", "sshd"]
+excluded_names = ["systemd", "wolfram", "sshd", "postgres", "mysqld", "mariadbd", "llama"]
 
 # PIDs to never touch.
 excluded_pids = [1]
 
 # Dry run — scan and report but don't compress or hibernate.
 dry_run = false
+
+# Skip any process holding a GPU / accelerator device open (/dev/dri,
+# /dev/kfd, /dev/nvidia*, /dev/accel). Their host-side buffers are ordinary
+# anonymous memory the device reads directly; paging them out only forces
+# driver refaults.
+skip_gpu_processes = true
+
+# Refault back-off. After MADV_PAGEOUT, Wolfram checks next cycle how many of
+# the pages it pushed out are back in RAM. If at least this fraction came
+# back, the region is hot: leave it alone for refault_backoff_cycles cycles.
+refault_backoff_threshold = 0.25
+refault_backoff_cycles = 10

@@ -64,27 +64,29 @@ impl Hibernator {
             anyhow::bail!("PID {pid} is already hibernated");
         }
 
-        // Create checkpoint directory.
         let checkpoint_dir = self.checkpoint_base.join(format!("pid_{pid}"));
-        if checkpoint_dir.exists() {
-            fs::remove_dir_all(&checkpoint_dir)?;
-        }
-        fs::create_dir_all(&checkpoint_dir)
-            .with_context(|| format!("creating checkpoint dir {}", checkpoint_dir.display()))?;
 
         // Find listening TCP ports before we kill the process.
         let ports = find_listening_ports(pid);
         debug!("  PID {pid} listening on ports: {ports:?}");
 
+        // Dry run must not touch the filesystem: an existing pid_N directory
+        // may hold a real checkpoint from an earlier run.
         if self.dry_run {
             info!(
                 "  [DRY RUN] Would checkpoint PID {pid} ({}) to {}",
                 proc_info.name,
                 checkpoint_dir.display()
             );
-            fs::remove_dir_all(&checkpoint_dir).ok();
             return Ok(());
         }
+
+        // Create checkpoint directory.
+        if checkpoint_dir.exists() {
+            fs::remove_dir_all(&checkpoint_dir)?;
+        }
+        fs::create_dir_all(&checkpoint_dir)
+            .with_context(|| format!("creating checkpoint dir {}", checkpoint_dir.display()))?;
 
         // Run criu dump.
         let output = Command::new("criu")
@@ -271,12 +273,11 @@ fn find_listening_ports(pid: u32) -> Vec<u16> {
             if let Ok(link) = fs::read_link(entry.path()) {
                 let link_str = link.to_string_lossy();
                 // Socket links look like "socket:[12345]"
-                if let Some(rest) = link_str.strip_prefix("socket:[") {
-                    if let Some(inode_str) = rest.strip_suffix(']') {
-                        if let Ok(inode) = inode_str.parse::<u64>() {
-                            socket_inodes.push(inode);
-                        }
-                    }
+                if let Some(rest) = link_str.strip_prefix("socket:[")
+                    && let Some(inode_str) = rest.strip_suffix(']')
+                    && let Ok(inode) = inode_str.parse::<u64>()
+                {
+                    socket_inodes.push(inode);
                 }
             }
         }
@@ -315,12 +316,12 @@ fn find_listening_ports(pid: u32) -> Vec<u16> {
                 continue; // not our socket
             }
             // fields[1] = local_address "hex_ip:hex_port"
-            if let Some(port_hex) = fields[1].split(':').nth(1) {
-                if let Ok(port) = u16::from_str_radix(port_hex, 16) {
-                    if port > 0 && !ports.contains(&port) {
-                        ports.push(port);
-                    }
-                }
+            if let Some(port_hex) = fields[1].split(':').nth(1)
+                && let Ok(port) = u16::from_str_radix(port_hex, 16)
+                && port > 0
+                && !ports.contains(&port)
+            {
+                ports.push(port);
             }
         }
     }
